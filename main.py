@@ -24,7 +24,6 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Дзеркала для YouTube (щоб не банили)
 COBALT_MIRRORS = [
     "https://co.wuk.sh/api/json",
     "https://api.cobalt.tools/api/json",
@@ -96,23 +95,13 @@ async def translate_text(text):
     except: pass
     return text
 
-# 🔥 ВИПРАВЛЕНИЙ ФОРМАТ ПІДПИСУ 🔥
-# Тепер ім'я автора - це і є посилання на нього
-def format_caption(nickname, profile_url, title, original_url):
-    # 1. Ім'я автора (жирним і клікабельним)
+def format_caption(nickname, username, profile_url, title, original_url):
     caption = f"👤 <a href='{profile_url}'><b>{nickname}</b></a>\n\n"
-    
-    # 2. Опис (якщо є)
-    if title:
-        caption += f"📝 {title}\n\n"
-    
-    # 3. Посилання на оригінал
+    if title: caption += f"📝 {title}\n\n"
     caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
-    
-    if len(caption) > 1024: caption = caption[:1000] + "..."
-    return caption
+    return caption[:1000] + "..." if len(caption) > 1024 else caption
 
-# --- YOUTUBE HELPERS (COBALT + FFMPEG) ---
+# --- HELPERS ---
 async def cobalt_get_url(user_url, quality=720):
     payload = {
         "url": user_url,
@@ -143,7 +132,7 @@ def process_media_locally(input_path, output_path, audio_only=False, cut_range=N
     cmd.append(output_path)
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# --- ФОНОВІ ЗАДАЧІ ---
+# --- TASKS ---
 async def keep_alive_ping():
     logging.info("🚀 Ping service started!")
     await asyncio.sleep(10)
@@ -163,17 +152,21 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080)))
     await site.start()
 
-# --- ОБРОБНИКИ ---
+# --- ОБРОБНИКИ (ПІДТРИМКА CAPTION ТА EDIT) ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer("Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.")
 
 # === TIKTOK ===
-@dp.message(F.text.contains("tiktok.com"))
+@dp.message(F.text.contains("tiktok.com") | F.caption.contains("tiktok.com"))
+@dp.edited_message(F.text.contains("tiktok.com") | F.caption.contains("tiktok.com"))
 async def handle_tiktok(message: types.Message):
-    user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
+    # Читаємо або текст, або підпис (caption)
+    content = message.text or message.caption
+    user_url, clean_mode, audio_mode, _, _ = parse_message_data(content)
     if not user_url: return
+    
     status_msg = await message.reply("🎵 TikTok: Обробляю...")
     
     try:
@@ -186,23 +179,15 @@ async def handle_tiktok(message: types.Message):
             return
             
         data = result['data']
-        
-        # 🟢 ПІДПИС
         caption_text = None
         if not clean_mode:
             trans_desc = await translate_text(data.get('title', ''))
             author = data.get('author', {})
             unique_id = author.get('unique_id', '')
-            caption_text = format_caption(
-                author.get('nickname', 'User'), # Нікнейм для відображення
-                f"https://www.tiktok.com/@{unique_id}", # Посилання на профіль
-                trans_desc, 
-                user_url
-            )
+            caption_text = format_caption(author.get('nickname', 'User'), f"https://www.tiktok.com/@{unique_id}", trans_desc, user_url)
 
         has_images = 'images' in data and data['images']
         music_file = None
-        
         if audio_mode or has_images:
             music_bytes = await download_content(data.get('music'))
             if music_bytes: music_file = BufferedInputFile(music_bytes, filename="music.mp3")
@@ -222,7 +207,6 @@ async def handle_tiktok(message: types.Message):
             if added > 0: await message.answer_media_group(mg.build())
             if music_file: await message.answer_audio(music_file)
             await status_msg.delete()
-            
         else:
             await status_msg.edit_text("🎥 TikTok: Відео...")
             vid_bytes, cover_bytes = await asyncio.gather(download_content(data.get('hdplay') or data.get('play')), download_content(data.get('origin_cover')))
@@ -232,18 +216,17 @@ async def handle_tiktok(message: types.Message):
                 await message.answer_video(vfile, caption=caption_text, parse_mode="HTML", thumbnail=tfile, width=720, height=1280)
                 if music_file: await message.answer_audio(music_file)
                 await status_msg.delete()
-                
-    except Exception as e:
-        logging.error(f"TikTok Error: {e}")
-        await status_msg.edit_text("❌ Помилка TikTok.")
+    except: await status_msg.edit_text("❌ Помилка TikTok.")
 
 # === INSTAGRAM ===
-@dp.message(F.text.contains("instagram.com"))
+@dp.message(F.text.contains("instagram.com") | F.caption.contains("instagram.com"))
+@dp.edited_message(F.text.contains("instagram.com") | F.caption.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
-    user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
+    content = message.text or message.caption
+    user_url, clean_mode, audio_mode, _, _ = parse_message_data(content)
     if not user_url: return
-    status_msg = await message.reply("📸 Instagram: Аналізую...")
     
+    status_msg = await message.reply("📸 Instagram: Аналізую...")
     shortcode_match = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url)
     if not shortcode_match:
         await status_msg.edit_text("❌ Instagram: Не зрозумів посилання.")
@@ -257,20 +240,13 @@ async def handle_instagram(message: types.Message):
             return instaloader.Post.from_shortcode(L.context, code)
 
         post = await asyncio.to_thread(get_insta_data, shortcode)
-        
-        # 🟢 ПІДПИС
         caption_text = None
         if not clean_mode:
             raw_caption = post.caption or ""
             raw_caption = raw_caption.split('\n')[0] if raw_caption else ""
             trans_desc = await translate_text(raw_caption)
             author = post.owner_username
-            caption_text = format_caption(
-                author,
-                f"https://instagram.com/{author}",
-                trans_desc,
-                user_url
-            )
+            caption_text = format_caption(author, f"https://instagram.com/{author}", trans_desc, user_url)
 
         media_group = MediaGroupBuilder()
         tasks = []
@@ -298,7 +274,6 @@ async def handle_instagram(message: types.Message):
             else:
                 pfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.jpg")
                 await message.answer_photo(pfile, caption=caption_text, parse_mode="HTML")
-                
         elif len(results) > 1:
             for idx, content_bytes in enumerate(results):
                 if content_bytes:
@@ -313,17 +288,15 @@ async def handle_instagram(message: types.Message):
                         else: media_group.add_photo(media=m_file)
                     files_added += 1
             if files_added > 0: await message.answer_media_group(media_group.build())
-            
         await status_msg.delete()
-        
-    except Exception as e:
-        logging.error(f"Instagram Instaloader Error: {e}")
-        await status_msg.edit_text("❌ Instagram: Не вдалося завантажити.")
+    except: await status_msg.edit_text("❌ Instagram: Не вдалося завантажити.")
 
 # === TWITTER ===
-@dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
+@dp.message(F.text.contains("twitter.com") | F.caption.contains("twitter.com") | F.text.contains("x.com") | F.caption.contains("x.com"))
+@dp.edited_message(F.text.contains("twitter.com") | F.caption.contains("twitter.com") | F.text.contains("x.com") | F.caption.contains("x.com"))
 async def handle_twitter(message: types.Message):
-    user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
+    content = message.text or message.caption
+    user_url, clean_mode, audio_mode, _, _ = parse_message_data(content)
     if not user_url: return
     status_msg = await message.reply("🐦 Twitter: Аналізую...")
     match = re.search(r"/status/(\d+)", user_url)
@@ -334,18 +307,11 @@ async def handle_twitter(message: types.Message):
             async with session.get(f"https://api.fxtwitter.com/status/{match.group(1)}") as r:
                 json_data = await r.json()
         tweet = json_data.get('tweet', {})
-        
-        # 🟢 ПІДПИС
         caption_text = None
         if not clean_mode:
             text = await translate_text(tweet.get('text', ''))
             author = tweet.get('author', {})
-            caption_text = format_caption(
-                author.get('name', 'User'), 
-                f"https://twitter.com/{author.get('screen_name', 'tw')}",
-                text, 
-                user_url
-            )
+            caption_text = format_caption(author.get('name', 'User'), f"https://twitter.com/{author.get('screen_name', 'tw')}", text, user_url)
             
         media_list = tweet.get('media', {}).get('all', [])
         if not media_list:
@@ -371,13 +337,14 @@ async def handle_twitter(message: types.Message):
                     added += 1
             if added>0: await message.answer_media_group(mg.build())
         await status_msg.delete()
-    except:
-        await status_msg.edit_text("❌ Помилка Twitter.")
+    except: await status_msg.edit_text("❌ Помилка Twitter.")
 
-# === YOUTUBE (PROXY) ===
-@dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
+# === YOUTUBE ===
+@dp.message(F.text.contains("youtube.com") | F.caption.contains("youtube.com") | F.text.contains("youtu.be") | F.caption.contains("youtu.be"))
+@dp.edited_message(F.text.contains("youtube.com") | F.caption.contains("youtube.com") | F.text.contains("youtu.be") | F.caption.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
-    user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
+    content = message.text or message.caption
+    user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(content)
     if not user_url: return
 
     action_text = "Завантажую..."
