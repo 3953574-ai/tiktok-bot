@@ -25,17 +25,20 @@ async def download_content(url):
     """Скачує файл за посиланням"""
     if not url:
         return None
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                return await response.read()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.read()
+    except Exception as e:
+        logging.error(f"Error downloading {url}: {e}")
     return None
 
 def create_caption(data, original_url):
-    """Створює гарний підпис для відео"""
+    """Створює гарний підпис"""
     author = data.get('author', {})
     nickname = author.get('nickname', 'Unknown')
-    unique_id = author.get('unique_id', '') # це @username
+    unique_id = author.get('unique_id', '') 
     title = data.get('title', '')
     
     caption = (
@@ -69,17 +72,16 @@ async def handle_tiktok_link(message: types.Message):
         data = result['data']
         caption_text = create_caption(data, user_url)
         
-        # Скачування музики
+        # Музика
         music_url = data.get('music')
         music_bytes = await download_content(music_url)
-        
         music_info = data.get('music_info', {})
         music_title = music_info.get('title', 'original sound')
         music_author = music_info.get('author', 'TikTok')
         music_filename = f"{music_author} - {music_title}.mp3"
-        music_file = BufferedInputFile(music_bytes, filename=music_filename)
+        music_file = BufferedInputFile(music_bytes, filename=music_filename) if music_bytes else None
 
-        # --- СЛАЙДЕР (ФОТО) ---
+        # --- ФОТО ---
         if 'images' in data and data['images']:
             await status_msg.edit_text("📸 Завантажую фото...")
             images = data['images']
@@ -98,18 +100,21 @@ async def handle_tiktok_link(message: types.Message):
                 await message.answer_media_group(media_group.build())
                 first_album = False
             
-            await message.answer_audio(music_file, caption=f"🎵 {music_title}")
+            if music_file:
+                await message.answer_audio(music_file, caption=f"🎵 {music_title}")
             await status_msg.delete()
 
         # --- ВІДЕО ---
         else:
             await status_msg.edit_text("🎥 Завантажую відео...")
             
-            video_url = data.get('play')
+            # 🔥 БЕРЕМО HD ВЕРСІЮ (ОРИГІНАЛ)
+            # hdplay - це оригінал без стиснення (зазвичай 1080p або 720p)
+            # play - це іноді стиснена версія
+            video_url = data.get('hdplay') or data.get('play')
             
-            # 🔥 ФІКС ПРОБЛЕМИ З КВАДРАТНИМ ВІДЕО:
-            # Беремо origin_cover (оригінал), якщо його немає - беремо звичайний cover
-            cover_url = data.get('origin_cover', data.get('cover'))
+            # Беремо оригінальну обкладинку
+            cover_url = data.get('origin_cover') or data.get('cover')
 
             video_bytes, cover_bytes = await asyncio.gather(
                 download_content(video_url),
@@ -123,28 +128,29 @@ async def handle_tiktok_link(message: types.Message):
                 if cover_bytes:
                     thumbnail_file = BufferedInputFile(cover_bytes, filename="cover.jpg")
 
-                # Спробуємо отримати розміри відео з API, якщо вони є
-                width = data.get('width')
-                height = data.get('height')
+                # Отримуємо розміри відео з даних API
+                width = data.get('hd_size', {}).get('width') or data.get('size', {}).get('width')
+                height = data.get('hd_size', {}).get('height') or data.get('size', {}).get('height')
 
                 await message.answer_video(
                     video_file,
                     caption=caption_text,
                     parse_mode="HTML",
                     thumbnail=thumbnail_file,
-                    width=width,   # Підказуємо телеграму розмір
-                    height=height, # Підказуємо телеграму розмір
+                    width=width,   # Прямо вказуємо телеграму ширину
+                    height=height, # і висоту
                     supports_streaming=True
                 )
                 
-                await message.answer_audio(music_file, caption=f"🎵 {music_title}")
+                if music_file:
+                    await message.answer_audio(music_file, caption=f"🎵 {music_title}")
                 await status_msg.delete()
             else:
-                await status_msg.edit_text("❌ Помилка завантаження файлу відео.")
+                await status_msg.edit_text("❌ Помилка: файл відео не знайдено.")
 
     except Exception as e:
-        logging.error(e)
-        await status_msg.edit_text("❌ Сталася помилка. Спробуйте ще раз.")
+        logging.error(f"Main Loop Error: {e}")
+        await status_msg.edit_text("❌ Сталася помилка.")
 
 # --- ВЕБ-СЕРВЕР ---
 async def health_check(request):
@@ -161,6 +167,10 @@ async def start_web_server():
     logging.info(f"Web server started on port {port}")
 
 async def main():
+    # Запускаємо веб-сервер і бота
+    # Видаляємо вебхук перед поллінгом, щоб уникнути конфліктів
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot)
