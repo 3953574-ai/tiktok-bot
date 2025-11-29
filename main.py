@@ -9,8 +9,9 @@ import aiohttp
 from aiohttp import web
 
 # --- КОНФІГУРАЦІЯ ---
-# Токен беремо зі змінних оточення сервера
-BOT_TOKEN = os.getenv('BOT_TOKEN') 
+# Твій токен вписаний сюди:
+BOT_TOKEN = '8597904588:AAHXktg5JSdxzDuOwyI7d5gBHTCKk9J_Pco'
+
 API_URL = "https://www.tikwm.com/api/"
 
 logging.basicConfig(level=logging.INFO)
@@ -70,35 +71,4 @@ async def handle_tiktok_link(message: types.Message):
             video_bytes = await download_content(video_url)
             if video_bytes:
                 video_file = BufferedInputFile(video_bytes, filename=f"video_{data['id']}.mp4")
-                await message.answer_video(video_file, caption="🎬 Відео без знаку")
-                await message.answer_audio(music_file, caption="🎵 Звук")
-                await status_msg.delete()
-
-    except Exception as e:
-        logging.error(e)
-        await status_msg.edit_text("❌ Помилка.")
-
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
-async def health_check(request):
-    return web.Response(text="Bot is alive!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # Render дає порт через змінну оточення PORT, або використовуємо 8080
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"Web server started on port {port}")
-
-async def main():
-    # Запускаємо і веб-сервер (щоб Render не сварився), і бота
-    await asyncio.gather(
-        start_web_server(),
-        dp.start_polling(bot)
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                await message.answer_video(video_file, capt
