@@ -7,7 +7,8 @@ from aiogram.types import BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
-from googletrans import Translator
+# Підключаємо нову сучасну бібліотеку перекладу
+from deep_translator import GoogleTranslator
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -20,7 +21,9 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-translator = Translator()
+
+# Налаштовуємо перекладач (з автовизначення на українську)
+translator = GoogleTranslator(source='auto', target='uk')
 
 # --- ФУНКЦІЇ БОТА ---
 async def download_content(url):
@@ -37,7 +40,7 @@ async def download_content(url):
     return None
 
 async def create_caption(data, original_url):
-    """Створює розумний підпис: якщо опису немає, блок пропускається"""
+    """Створює підпис з перекладом (Deep Translator)"""
     author = data.get('author', {})
     nickname = author.get('nickname', 'Unknown')
     unique_id = author.get('unique_id', '') 
@@ -48,8 +51,8 @@ async def create_caption(data, original_url):
     # --- ПЕРЕКЛАД ---
     if original_title and original_title.strip():
         try:
-            result = await asyncio.to_thread(translator.translate, original_title, dest='uk')
-            translated_title = result.text
+            # Виконуємо переклад в окремому потоці, щоб не блокувати бота
+            translated_title = await asyncio.to_thread(translator.translate, original_title)
         except Exception as e:
             logging.error(f"Translation error: {e}")
             translated_title = original_title
@@ -57,17 +60,13 @@ async def create_caption(data, original_url):
         translated_title = ""
 
     # --- ФОРМУВАННЯ ТЕКСТУ ---
-    # 1. Автор
     caption = f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
     
-    # 2. Опис (додаємо ТІЛЬКИ якщо він не пустий)
     if translated_title and translated_title.strip():
         caption += f"📝 {translated_title}\n\n"
     
-    # 3. Посилання
     caption += f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
     
-    # Обрізка, якщо занадто довгий
     if len(caption) > 1024:
         caption = caption[:1000] + "..."
         
