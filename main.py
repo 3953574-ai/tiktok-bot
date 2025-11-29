@@ -14,9 +14,9 @@ from deep_translator import GoogleTranslator
 from langdetect import detect
 import instaloader
 import yt_dlp
-import static_ffmpeg # 🎞️ Бібліотека для FFmpeg
+import static_ffmpeg
 
-# Активуємо FFmpeg (додаємо його в систему)
+# Активуємо FFmpeg
 static_ffmpeg.add_paths()
 
 # --- КОНФІГУРАЦІЯ ---
@@ -24,6 +24,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
+# Логи
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -40,7 +41,6 @@ translator = GoogleTranslator(source='auto', target='uk')
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 
 def time_to_seconds(time_str):
-    """Перетворює час (01:02:03 або 05:30) в секунди"""
     parts = list(map(int, time_str.split(':')))
     if len(parts) == 3:
         return parts[0] * 3600 + parts[1] * 60 + parts[2]
@@ -59,7 +59,6 @@ def parse_message_data(text):
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text or 'video' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text or 'music' in cmd_text)
     
-    # Пошук команди cut (наприклад: cut 00:10-00:15)
     cut_range = None
     cut_match = re.search(r'cut\s+(\d{1,2}:\d{2}(?::\d{2})?)-(\d{1,2}:\d{2}(?::\d{2})?)', cmd_text)
     if cut_match:
@@ -103,7 +102,7 @@ def format_caption(nickname, username, profile_url, title, original_url):
 
 # --- ФОНОВІ ЗАДАЧІ ---
 async def keep_alive_ping():
-    logging.info("🚀 Ping service started! Waiting 10s for first ping...")
+    logging.info("🚀 Ping service started! Waiting 10s...")
     await asyncio.sleep(10)
     while True:
         try:
@@ -135,83 +134,61 @@ async def cmd_start(message: types.Message):
         "🎵 <b>TikTok</b>\n"
         "📸 <b>Instagram</b>\n"
         "🐦 <b>Twitter (X)</b>\n"
-        "📺 <b>YouTube (Shorts & Video)</b>\n\n"
-        "✂️ <b>Нарізка відео:</b>\n"
-        "Додай до посилання: <code>cut 00:10-00:35</code>\n"
-        "(виріже шматок з 10-ї по 35-ту секунду)",
+        "📺 <b>YouTube</b>\n\n"
+        "✂️ <b>Нарізка:</b> посилання + <code>cut 00:10-00:15</code>",
         parse_mode="HTML"
     )
 
-# === YOUTUBE (НОВЕ) ===
+# === YOUTUBE ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
     user_url, clean_mode, audio_mode, cut_range = parse_message_data(message.text)
     if not user_url: return
 
-    # Перевірка на тривалість вирізки (щоб не просили 10 годин)
     if cut_range:
         duration = cut_range[1] - cut_range[0]
-        if duration > 300: # Ліміт 5 хвилин для нарізки
-            await message.reply("✂️ Максимальна довжина вирізки — 5 хвилин.")
+        if duration > 300:
+            await message.reply("✂️ Максимум 5 хвилин для нарізки.")
             return
-        status_msg = await message.reply(f"📺 YouTube: Вирізаю шматок ({duration}с)... ✂️")
+        status_msg = await message.reply(f"📺 YouTube: Вирізаю ({duration}с)... ✂️")
     else:
         status_msg = await message.reply("📺 YouTube: Завантажую...")
 
-    # Створюємо папку
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
 
-    # Базові налаштування
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
-        # Обмежуємо якість до 1080p, щоб не вбити пам'ять
         'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
     }
 
-    # Якщо треба ТІЛЬКИ АУДІО (режим !a) і немає нарізки
     if audio_mode and not cut_range:
         ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-        }]
+        ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
         ydl_opts['outtmpl'] = 'downloads/%(id)s.mp3'
 
-    # Якщо є НАРІЗКА (cut)
     if cut_range:
-        # Функція для скачування тільки діапазону
-        def download_range_func(info_dict, ydl):
-            return [{
-                'start_time': cut_range[0],
-                'end_time': cut_range[1]
-            }]
-        ydl_opts['download_ranges'] = download_range_func
-        # Примусово зшиваємо в точних місцях
+        ydl_opts['download_ranges'] = lambda info, ydl: [{'start_time': cut_range[0], 'end_time': cut_range[1]}]
         ydl_opts['force_keyframes_at_cuts'] = True 
 
     try:
         loop = asyncio.get_event_loop()
-        
         def download_task():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(user_url, download=True)
-                return info
+                return ydl.extract_info(user_url, download=True)
 
         info_dict = await loop.run_in_executor(None, download_task)
         file_id = info_dict.get('id')
-        
-        # Шукаємо файл (відео або mp3)
         files = glob.glob(f"downloads/{file_id}*")
+        
         if not files:
             await status_msg.edit_text("❌ YouTube: Помилка файлу.")
             return
 
-        file_path = files[0] # Беремо перший знайдений
-
-        # Підпис
+        file_path = files[0]
+        
         caption_text = None
         if not clean_mode:
             title = info_dict.get('title', '')
@@ -221,28 +198,25 @@ async def handle_youtube(message: types.Message):
 
         input_file = FSInputFile(file_path)
 
-        # Відправка
         if file_path.endswith(".mp3"):
             await message.answer_audio(input_file, caption=caption_text, parse_mode="HTML")
         else:
             await message.answer_video(input_file, caption=caption_text, parse_mode="HTML")
-            # Якщо хотіли аудіо в нарізці
             if audio_mode and cut_range:
                  audio_file = FSInputFile(file_path, filename="cut_audio.mp3")
-                 await message.answer_audio(audio_file, caption="🎵 Звук з вирізки")
+                 await message.answer_audio(audio_file, caption="🎵 Звук")
 
         await status_msg.delete()
         os.remove(file_path)
 
     except Exception as e:
         logging.error(f"YouTube Error: {e}")
-        await status_msg.edit_text("❌ Занадто великий файл або помилка доступу.")
-        # Чистимо сміття якщо є
+        await status_msg.edit_text("❌ Помилка завантаження.")
         for f in glob.glob(f"downloads/*"):
             try: os.remove(f)
             except: pass
 
-# === INSTAGRAM (INSTALOADER) ===
+# === INSTAGRAM ===
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
     user_url, clean_mode, audio_mode, _ = parse_message_data(message.text)
@@ -283,7 +257,6 @@ async def handle_instagram(message: types.Message):
 
         results = await asyncio.gather(*[t[0] for t in tasks])
         files_added = 0
-        
         if len(results) == 1 and results[0]:
             content_bytes = results[0]
             type_str = tasks[0][1]
@@ -313,14 +286,13 @@ async def handle_instagram(message: types.Message):
         await status_msg.delete()
     except Exception as e:
         logging.error(f"Instagram Instaloader Error: {e}")
-        await status_msg.edit_text("❌ Instagram: Не вдалося завантажити (можливо 18+ або логін).")
+        await status_msg.edit_text("❌ Instagram: Помилка (спробуй пізніше).")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok(message: types.Message):
     user_url, clean_mode, audio_mode, _ = parse_message_data(message.text)
     if not user_url: return
-
     status_msg = await message.reply("🎵 TikTok: Обробляю...")
     try:
         async with aiohttp.ClientSession() as session:
@@ -329,7 +301,6 @@ async def handle_tiktok(message: types.Message):
         if result.get('code') != 0:
             await status_msg.edit_text("❌ TikTok: Не знайдено.")
             return
-
         data = result['data']
         caption_text = None
         if not clean_mode:
@@ -337,143 +308,95 @@ async def handle_tiktok(message: types.Message):
             author = data.get('author', {})
             unique_id = author.get('unique_id', '')
             caption_text = format_caption(author.get('nickname', 'User'), unique_id, f"https://www.tiktok.com/@{unique_id}", trans_desc, user_url)
-
         has_images = 'images' in data and data['images']
-        should_download_music = audio_mode or has_images
         music_file = None
-        if should_download_music:
-            music_url = data.get('music')
-            music_bytes = await download_content(music_url)
-            music_info = data.get('music_info', {})
-            music_name = f"{music_info.get('author','')} - {music_info.get('title','')}.mp3"
-            if music_bytes: music_file = BufferedInputFile(music_bytes, filename=music_name)
-
+        if audio_mode or has_images:
+            music_bytes = await download_content(data.get('music'))
+            if music_bytes: music_file = BufferedInputFile(music_bytes, filename="music.mp3")
         if has_images:
             await status_msg.edit_text("📸 TikTok: Качаю фото...")
-            images_urls = data['images']
-            chunk_size = 10
-            first = True
-            for i in range(0, len(images_urls), chunk_size):
-                chunk_urls = images_urls[i:i + chunk_size]
-                tasks = [download_content(url) for url in chunk_urls]
-                downloaded_images = await asyncio.gather(*tasks)
-                media_group = MediaGroupBuilder()
-                images_added = 0
-                for idx, img_bytes in enumerate(downloaded_images):
-                    if img_bytes:
-                        img_file = BufferedInputFile(img_bytes, filename=f"img_{i}_{idx}.jpg")
-                        if first and images_added == 0 and caption_text: media_group.add_photo(media=img_file, caption=caption_text, parse_mode="HTML")
-                        else: media_group.add_photo(media=img_file)
-                        images_added += 1
-                if images_added > 0:
-                    await message.answer_media_group(media_group.build())
-                    first = False
-            if music_file: await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
+            tasks = [download_content(url) for url in data['images']]
+            images = await asyncio.gather(*tasks)
+            mg = MediaGroupBuilder()
+            added = 0
+            for idx, img in enumerate(images):
+                if img:
+                    f = BufferedInputFile(img, filename=f"img_{idx}.jpg")
+                    if added==0 and caption_text: mg.add_photo(f, caption=caption_text, parse_mode="HTML")
+                    else: mg.add_photo(f)
+                    added += 1
+            if added > 0: await message.answer_media_group(mg.build())
+            if music_file: await message.answer_audio(music_file)
             await status_msg.delete()
         else:
             await status_msg.edit_text("🎥 TikTok: Відео...")
-            vid_url = data.get('hdplay') or data.get('play')
-            cover_url = data.get('origin_cover') or data.get('cover')
-            vid_bytes, cover_bytes = await asyncio.gather(download_content(vid_url), download_content(cover_url))
+            vid_bytes, cover_bytes = await asyncio.gather(download_content(data.get('hdplay') or data.get('play')), download_content(data.get('origin_cover')))
             if vid_bytes:
                 vfile = BufferedInputFile(vid_bytes, filename=f"tk_{data['id']}.mp4")
                 tfile = BufferedInputFile(cover_bytes, filename="cover.jpg") if cover_bytes else None
-                w, h = 720, 1280
-                try: w, h = int(data.get('width')), int(data.get('height'))
-                except: pass
-                if not w or not h: w, h = 720, 1280
-                await message.answer_video(vfile, caption=caption_text, parse_mode="HTML", thumbnail=tfile, width=w, height=h, supports_streaming=True)
-                if music_file: await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
+                await message.answer_video(vfile, caption=caption_text, parse_mode="HTML", thumbnail=tfile, width=720, height=1280)
+                if music_file: await message.answer_audio(music_file)
                 await status_msg.delete()
     except Exception as e:
         logging.error(f"TikTok Error: {e}")
         await status_msg.edit_text("❌ Помилка TikTok.")
 
-# === TWITTER / X ===
+# === TWITTER ===
 @dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
 async def handle_twitter(message: types.Message):
     user_url, clean_mode, audio_mode, _ = parse_message_data(message.text)
     if not user_url: return
-
     status_msg = await message.reply("🐦 Twitter: Аналізую...")
     match = re.search(r"/status/(\d+)", user_url)
-    if not match:
-        await status_msg.edit_text("❌ Не знайдено ID.")
-        return
-    tweet_id = match.group(1)
-    api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
-
+    if not match: return
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as response:
-                if response.status != 200:
-                    await status_msg.edit_text("❌ Твіт не знайдено.")
-                    return
-                json_data = await response.json()
-
+            async with session.get(f"https://api.fxtwitter.com/status/{match.group(1)}") as r:
+                json_data = await r.json()
         tweet = json_data.get('tweet', {})
-        if not tweet:
-            await status_msg.edit_text("❌ Помилка API.")
-            return
-
         caption_text = None
         if not clean_mode:
-            trans_text = await translate_text(tweet.get('text', ''))
+            text = await translate_text(tweet.get('text', ''))
             author = tweet.get('author', {})
-            screen_name = author.get('screen_name', 'twitter')
-            caption_text = format_caption(author.get('name', 'User'), screen_name, f"https://twitter.com/{screen_name}", trans_text, user_url)
-
+            caption_text = format_caption(author.get('name', 'User'), author.get('screen_name', 'tw'), user_url, text, user_url)
         media_list = tweet.get('media', {}).get('all', [])
         if not media_list:
-            if not clean_mode: await message.answer(caption_text, parse_mode="HTML", disable_web_page_preview=True)
-            else: await message.answer("❌ Немає медіа.")
-            await status_msg.delete()
+            await message.answer("❌ Немає медіа.")
             return
-
+        
         has_video = any(m['type'] in ['video', 'gif'] for m in media_list)
         if has_video:
-            await status_msg.edit_text("⬇️ Twitter: Відео...")
             vdata = next((m for m in media_list if m['type'] in ['video', 'gif']), None)
-            if vdata:
-                vbytes = await download_content(vdata['url'])
-                if vbytes:
-                    vfile = BufferedInputFile(vbytes, filename=f"tw_{tweet_id}.mp4")
-                    w = vdata.get('width')
-                    h = vdata.get('height')
-                    await message.answer_video(vfile, caption=caption_text, parse_mode="HTML", width=w, height=h, supports_streaming=True)
-                    if audio_mode:
-                        afile = BufferedInputFile(vbytes, filename=f"tw_audio_{tweet_id}.mp3")
-                        await message.answer_audio(afile, caption="🎵 Звук з твіта")
-                    await status_msg.delete()
-                    return
+            vbytes = await download_content(vdata['url'])
+            if vbytes:
+                await message.answer_video(BufferedInputFile(vbytes, filename="tw.mp4"), caption=caption_text, parse_mode="HTML")
+                if audio_mode: await message.answer_audio(BufferedInputFile(vbytes, filename="tw.mp3"))
         else:
-            await status_msg.edit_text("⬇️ Twitter: Фото...")
-            if len(media_list) == 1:
-                p_bytes = await download_content(media_list[0]['url'])
-                if p_bytes:
-                    p_file = BufferedInputFile(p_bytes, filename="photo.jpg")
-                    await message.answer_photo(p_file, caption=caption_text, parse_mode="HTML")
-            else:
-                tasks = [download_content(m['url']) for m in media_list]
-                results = await asyncio.gather(*tasks)
-                media_group = MediaGroupBuilder()
-                added = 0
-                for idx, p_bytes in enumerate(results):
-                    if p_bytes:
-                        p_file = BufferedInputFile(p_bytes, filename=f"p_{idx}.jpg")
-                        if added == 0 and caption_text: media_group.add_photo(media=p_file, caption=caption_text, parse_mode="HTML")
-                        else: media_group.add_photo(media=p_file)
-                        added += 1
-                if added > 0: await message.answer_media_group(media_group.build())
-            await status_msg.delete()
-    except Exception as e:
-        logging.error(f"Twitter Error: {e}")
-        await status_msg.edit_text("❌ Помилка.")
+            tasks = [download_content(m['url']) for m in media_list]
+            images = await asyncio.gather(*tasks)
+            mg = MediaGroupBuilder()
+            added = 0
+            for idx, img in enumerate(images):
+                if img:
+                    if added==0 and caption_text: mg.add_photo(BufferedInputFile(img, filename="p.jpg"), caption=caption_text, parse_mode="HTML")
+                    else: mg.add_photo(BufferedInputFile(img, filename="p.jpg"))
+                    added += 1
+            if added>0: await message.answer_media_group(mg.build())
+        await status_msg.delete()
+    except:
+        await status_msg.edit_text("❌ Помилка Twitter.")
 
+
+# 🔥 ОСНОВНА ФУНКЦІЯ ЗАПУСКУ (FIXED) 🔥
 async def main():
-    dp.startup.register(lambda: asyncio.gather(start_web_server(), keep_alive_ping()))
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    # ❗️ Виправляємо помилку: запускаємо все через gather, без lambda
+    await asyncio.gather(
+        start_web_server(),   # Веб-сервер
+        keep_alive_ping(),    # Пінг
+        dp.start_polling(bot) # Бот
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
