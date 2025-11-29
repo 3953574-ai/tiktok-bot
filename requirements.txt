@@ -3,3 +3,4 @@ aiohttp
 deep-translator
 langdetect
 yt-dlp
+instaloader
