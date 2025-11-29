@@ -134,12 +134,13 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    cookies_status = "Авторизований ✅" if os.path.exists('cookies.txt') else "Без входу ⚠️"
     await message.answer(
-        "Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.\n\n"
-        "🍪 <b>YouTube статус:</b> " + ("Авторизований ✅" if os.path.exists('cookies.txt') else "Без входу ⚠️")
+        f"Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.\n\n"
+        f"🍪 <b>YouTube статус:</b> {cookies_status}"
     )
 
-# === YOUTUBE (LOGGED IN) ===
+# === YOUTUBE (Fixed Format Selector) ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
     user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
@@ -158,21 +159,20 @@ async def handle_youtube(message: types.Message):
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
 
-    # Основні налаштування
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
-        'format': f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # 👇 ГОЛОВНА ЗМІНА: Більш гнучкий пошук форматів
+        'format': f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
+        'merge_output_format': 'mp4', # Примусово пакуємо в MP4
     }
 
-    # 🔥 ПІДКЛЮЧАЄМО КУКИ ЯКЩО Є 🔥
+    # Підключаємо куки
     if os.path.exists('cookies.txt'):
         ydl_opts['cookiefile'] = 'cookies.txt'
-        logging.info("🍪 Using cookies.txt for YouTube")
     else:
-        logging.warning("⚠️ No cookies.txt found! Using fallback clients.")
-        # Якщо куків немає, пробуємо Android Creator (він кращий ніж звичайний Android)
+        # Якщо куків немає, пробуємо Android Creator
         ydl_opts['extractor_args'] = {
             'youtube': {
                 'player_skip': ['webpage', 'configs', 'js'],
@@ -230,9 +230,11 @@ async def handle_youtube(message: types.Message):
         logging.error(f"YouTube Error: {e}")
         err_msg = str(e)
         if "Sign in" in err_msg:
-             await status_msg.edit_text("❌ YouTube не пускає. Перевір cookies.txt (вони могли застаріти).")
+             await status_msg.edit_text("❌ YouTube вимагає оновлення cookies.txt.")
+        elif "Requested format is not available" in err_msg:
+             await status_msg.edit_text("❌ Така якість недоступна для цього відео.")
         else:
-             await status_msg.edit_text("❌ Помилка завантаження. Спробуй пізніше.")
+             await status_msg.edit_text("❌ Помилка завантаження.")
         
         for f in glob.glob(f"downloads/*"):
             try: os.remove(f)
