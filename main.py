@@ -16,7 +16,6 @@ import instaloader
 import yt_dlp
 import static_ffmpeg
 
-# Активуємо FFmpeg
 static_ffmpeg.add_paths()
 
 # --- КОНФІГУРАЦІЯ ---
@@ -24,7 +23,6 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Логи
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -49,9 +47,9 @@ def time_to_seconds(time_str):
     return 0
 
 def parse_message_data(text):
-    if not text: return None, False, False, None
+    if not text: return None, False, False, None, 720
     url_match = re.search(r'(https?://[^\s]+)', text)
-    if not url_match: return None, False, False, None
+    if not url_match: return None, False, False, None, 720
     
     found_url = url_match.group(1)
     cmd_text = text.replace(found_url, "").lower()
@@ -59,6 +57,7 @@ def parse_message_data(text):
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text or 'video' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text or 'music' in cmd_text)
     
+    # Пошук команди нарізки
     cut_range = None
     cut_match = re.search(r'cut\s+(\d{1,2}:\d{2}(?::\d{2})?)-(\d{1,2}:\d{2}(?::\d{2})?)', cmd_text)
     if cut_match:
@@ -67,7 +66,13 @@ def parse_message_data(text):
         if end_sec > start_sec:
             cut_range = (start_sec, end_sec)
 
-    return found_url, clean_mode, audio_mode, cut_range
+    # Пошук якості (наприклад: 1080, 480, 360)
+    quality = 720 # Стандарт
+    res_match = re.search(r'\b(144|240|360|480|720|1080|1440|2160)\b', cmd_text)
+    if res_match:
+        quality = int(res_match.group(1))
+
+    return found_url, clean_mode, audio_mode, cut_range, quality
 
 async def download_content(url):
     if not url: return None
@@ -130,38 +135,50 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привіт! Я качаю з:\n"
-        "🎵 <b>TikTok</b>\n"
-        "📸 <b>Instagram</b>\n"
-        "🐦 <b>Twitter (X)</b>\n"
-        "📺 <b>YouTube</b>\n\n"
-        "✂️ <b>Нарізка:</b> посилання + <code>cut 00:10-00:15</code>",
+        "Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.\n\n"
+        "📺 <b>Якість YouTube:</b>\n"
+        "За замовчуванням: <b>720p</b>\n"
+        "Вказати іншу: <code>посилання 1080</code> (або 480, 1440)\n\n"
+        "✂️ <b>Нарізка:</b>\n"
+        "<code>посилання cut 00:10-00:30</code>",
         parse_mode="HTML"
     )
 
-# === YOUTUBE ===
+# === YOUTUBE (Anti-Bot Fix + Quality) ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
-    user_url, clean_mode, audio_mode, cut_range = parse_message_data(message.text)
+    user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
     if not user_url: return
 
+    action_text = f"Завантажую ({quality}p)..."
     if cut_range:
         duration = cut_range[1] - cut_range[0]
         if duration > 300:
             await message.reply("✂️ Максимум 5 хвилин для нарізки.")
             return
-        status_msg = await message.reply(f"📺 YouTube: Вирізаю ({duration}с)... ✂️")
-    else:
-        status_msg = await message.reply("📺 YouTube: Завантажую...")
+        action_text = f"Вирізаю шматок ({duration}с)..."
+        
+    status_msg = await message.reply(f"📺 YouTube: {action_text}")
 
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
+
+    # Формуємо рядок формату
+    # Наприклад: bestvideo[height<=1080]+bestaudio
+    format_str = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
-        'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': format_str,
+        # 👇 ГОЛОВНИЙ ФІКС ПОМИЛКИ "Sign in"
+        # Прикидаємось клієнтом Android, щоб обійти перевірку
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios']
+            }
+        },
     }
 
     if audio_mode and not cut_range:
@@ -184,7 +201,7 @@ async def handle_youtube(message: types.Message):
         files = glob.glob(f"downloads/{file_id}*")
         
         if not files:
-            await status_msg.edit_text("❌ YouTube: Помилка файлу.")
+            await status_msg.edit_text("❌ YouTube: Помилка файлу (можливо, якість недоступна).")
             return
 
         file_path = files[0]
@@ -194,7 +211,8 @@ async def handle_youtube(message: types.Message):
             title = info_dict.get('title', '')
             trans_title = await translate_text(title)
             author = info_dict.get('uploader', 'YouTube')
-            caption_text = f"📺 <b>{author}</b>\n\n📝 {trans_title}\n\n🔗 <a href='{user_url}'>YouTube</a>"
+            res_info = f"{quality}p" if not audio_mode else "Audio"
+            caption_text = f"📺 <b>{author}</b> ({res_info})\n\n📝 {trans_title}\n\n🔗 <a href='{user_url}'>YouTube</a>"
 
         input_file = FSInputFile(file_path)
 
@@ -211,7 +229,12 @@ async def handle_youtube(message: types.Message):
 
     except Exception as e:
         logging.error(f"YouTube Error: {e}")
-        await status_msg.edit_text("❌ Помилка завантаження.")
+        err_msg = str(e)
+        if "Sign in" in err_msg:
+             await status_msg.edit_text("❌ YouTube заблокував запит (вимагає входу). Спробуйте пізніше або інше відео.")
+        else:
+             await status_msg.edit_text("❌ Помилка завантаження.")
+        
         for f in glob.glob(f"downloads/*"):
             try: os.remove(f)
             except: pass
@@ -219,7 +242,7 @@ async def handle_youtube(message: types.Message):
 # === INSTAGRAM ===
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
-    user_url, clean_mode, audio_mode, _ = parse_message_data(message.text)
+    user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
     if not user_url: return
 
     status_msg = await message.reply("📸 Instagram: Аналізую...")
@@ -286,12 +309,12 @@ async def handle_instagram(message: types.Message):
         await status_msg.delete()
     except Exception as e:
         logging.error(f"Instagram Instaloader Error: {e}")
-        await status_msg.edit_text("❌ Instagram: Помилка (спробуй пізніше).")
+        await status_msg.edit_text("❌ Instagram: Не вдалося завантажити.")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok(message: types.Message):
-    user_url, clean_mode, audio_mode, _ = parse_message_data(message.text)
+    user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
     if not user_url: return
     status_msg = await message.reply("🎵 TikTok: Обробляю...")
     try:
@@ -344,7 +367,7 @@ async def handle_tiktok(message: types.Message):
 # === TWITTER ===
 @dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
 async def handle_twitter(message: types.Message):
-    user_url, clean_mode, audio_mode, _ = parse_message_data(message.text)
+    user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
     if not user_url: return
     status_msg = await message.reply("🐦 Twitter: Аналізую...")
     match = re.search(r"/status/(\d+)", user_url)
@@ -363,7 +386,6 @@ async def handle_twitter(message: types.Message):
         if not media_list:
             await message.answer("❌ Немає медіа.")
             return
-        
         has_video = any(m['type'] in ['video', 'gif'] for m in media_list)
         if has_video:
             vdata = next((m for m in media_list if m['type'] in ['video', 'gif']), None)
@@ -386,17 +408,9 @@ async def handle_twitter(message: types.Message):
     except:
         await status_msg.edit_text("❌ Помилка Twitter.")
 
-
-# 🔥 ОСНОВНА ФУНКЦІЯ ЗАПУСКУ (FIXED) 🔥
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # ❗️ Виправляємо помилку: запускаємо все через gather, без lambda
-    await asyncio.gather(
-        start_web_server(),   # Веб-сервер
-        keep_alive_ping(),    # Пінг
-        dp.start_polling(bot) # Бот
-    )
+    await asyncio.gather(start_web_server(), keep_alive_ping(), dp.start_polling(bot))
 
 if __name__ == "__main__":
     asyncio.run(main())
