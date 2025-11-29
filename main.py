@@ -51,11 +51,14 @@ async def translate_text(text):
         logging.error(f"Translation error: {e}")
     return text
 
-def format_caption(nickname, username, title, original_url):
-    """Формує підпис"""
-    caption = f"👤 <b>{nickname}</b> (@{username})\n\n"
+def format_caption(nickname, username, profile_url, title, original_url):
+    """Формує підпис з клікабельним нікнеймом"""
+    # Нікнейм тепер є посиланням
+    caption = f"👤 <b>{nickname}</b> (<a href='{profile_url}'>@{username}</a>)\n\n"
+    
     if title:
         caption += f"📝 {title}\n\n"
+    
     caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
     
     if len(caption) > 1024:
@@ -90,11 +93,17 @@ async def handle_tiktok(message: types.Message):
         trans_desc = await translate_text(orig_desc)
         
         author = data.get('author', {})
+        unique_id = author.get('unique_id', '') # Це нікнейм без @
+        
+        # Формуємо посилання на профіль TikTok
+        profile_link = f"https://www.tiktok.com/@{unique_id}"
+        
         caption_text = format_caption(
-            author.get('nickname', 'User'),
-            author.get('unique_id', ''),
-            trans_desc,
-            user_url
+            nickname=author.get('nickname', 'User'),
+            username=unique_id,
+            profile_url=profile_link, # Передаємо посилання
+            title=trans_desc,
+            original_url=user_url
         )
 
         # Музика
@@ -163,13 +172,12 @@ async def handle_tiktok(message: types.Message):
         await status_msg.edit_text("❌ Помилка TikTok.")
 
 
-# === TWITTER / X (Виправлено фільтр) ===
+# === TWITTER / X ===
 @dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
 async def handle_twitter(message: types.Message):
     user_url = message.text.strip()
     status_msg = await message.reply("🐦 Twitter: Аналізую...")
 
-    # Шукаємо цифри після /status/ незалежно від сміття навколо
     match = re.search(r"/status/(\d+)", user_url)
     if not match:
         await status_msg.edit_text("❌ Не можу знайти ID твіта в посиланні.")
@@ -196,11 +204,17 @@ async def handle_twitter(message: types.Message):
         trans_text = await translate_text(text)
         
         author = tweet.get('author', {})
+        screen_name = author.get('screen_name', 'twitter')
+        
+        # Формуємо посилання на профіль Twitter
+        profile_link = f"https://twitter.com/{screen_name}"
+
         caption_text = format_caption(
-            author.get('name', 'User'),
-            author.get('screen_name', 'twitter'),
-            trans_text,
-            user_url
+            nickname=author.get('name', 'User'),
+            username=screen_name,
+            profile_url=profile_link, # Передаємо посилання
+            title=trans_text,
+            original_url=user_url
         )
 
         media_list = tweet.get('media', {}).get('all', [])
