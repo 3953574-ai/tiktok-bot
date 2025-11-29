@@ -1,4 +1,5 @@
 import logging
+import sys
 import os
 import asyncio
 import re
@@ -17,7 +18,12 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-logging.basicConfig(level=logging.INFO)
+# 👇 Налаштовуємо логи, щоб вони писались одразу в консоль Render
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 if not BOT_TOKEN:
     raise ValueError("Не знайдено BOT_TOKEN у змінних оточення!")
@@ -73,14 +79,14 @@ def format_caption(nickname, username, profile_url, title, original_url):
 
 # --- ФОНОВІ ЗАДАЧІ ---
 async def keep_alive_ping():
-    logging.info("🚀 Ping service started! First check in 10 seconds...")
-    await asyncio.sleep(10) # Розігрів 10 секунд
+    logging.info("🚀 Ping service started! Waiting 10s for first ping...")
+    await asyncio.sleep(10) # Чекаємо 10 сек після старту
     
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL) as response:
-                    logging.info(f"🔔 Ping sent to myself. Status: {response.status}")
+                    logging.info(f"🔔 Self-Ping status: {response.status}")
         except Exception as e:
             logging.error(f"❌ Ping failed: {e}")
         
@@ -123,6 +129,7 @@ async def handle_instagram(message: types.Message):
     try:
         def get_insta_data(code):
             L = instaloader.Instaloader(quiet=True)
+            # Емулюємо iPhone
             L.context._user_agent = "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 446464522)"
             return instaloader.Post.from_shortcode(L.context, code)
 
@@ -139,7 +146,7 @@ async def handle_instagram(message: types.Message):
         media_group = MediaGroupBuilder()
         tasks = []
         
-        # Галерея або один файл
+        # Перевірка: Галерея чи один файл
         if post.typename == 'GraphSidecar':
             nodes = list(post.get_sidecar_nodes())
             for node in nodes:
@@ -157,7 +164,7 @@ async def handle_instagram(message: types.Message):
         
         files_added = 0
         
-        # Один файл
+        # 1. Один файл
         if len(results) == 1 and results[0]:
             content_bytes = results[0]
             type_str = tasks[0][1]
@@ -172,7 +179,7 @@ async def handle_instagram(message: types.Message):
                 pfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.jpg")
                 await message.answer_photo(pfile, caption=caption_text, parse_mode="HTML")
 
-        # Багато файлів
+        # 2. Багато файлів
         elif len(results) > 1:
             for idx, content_bytes in enumerate(results):
                 if content_bytes:
@@ -407,10 +414,8 @@ async def handle_twitter(message: types.Message):
         logging.error(f"Twitter Error: {e}")
         await status_msg.edit_text("❌ Помилка.")
 
-# --- ГОЛОВНА ФУНКЦІЯ (ASYNCIO.GATHER) ---
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаємо все разом паралельно
     await asyncio.gather(
         start_web_server(),
         keep_alive_ping(),
