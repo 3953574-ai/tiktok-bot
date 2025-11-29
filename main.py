@@ -14,6 +14,8 @@ from langdetect import detect
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
+# 👇 ВСТАВ СЮДИ СВОЄ ПОСИЛАННЯ З RENDER
+RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,7 +27,6 @@ dp = Dispatcher()
 translator = GoogleTranslator(source='auto', target='uk')
 
 # --- РОЗУМНИЙ ПАРСИНГ ---
-
 def parse_message_data(text):
     if not text: return None, False, False
     url_match = re.search(r'(https?://[^\s]+)', text)
@@ -67,6 +68,17 @@ def format_caption(nickname, username, profile_url, title, original_url):
     if len(caption) > 1024: caption = caption[:1000] + "..."
     return caption
 
+# --- САМО-ПІНГ (ЩОБ НЕ СПАВ) ---
+async def keep_alive_ping():
+    while True:
+        await asyncio.sleep(180)  # ⏳ 3 хвилини (180 секунд)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(RENDER_URL) as response:
+                    logging.info(f"🔔 Ping sent to myself. Status: {response.status}")
+        except Exception as e:
+            logging.error(f"❌ Ping failed: {e}")
+
 # --- ОБРОБНИКИ ---
 
 @dp.message(CommandStart())
@@ -92,7 +104,6 @@ async def handle_tiktok(message: types.Message):
 
         data = result['data']
         
-        # Підпис
         caption_text = None
         if not clean_mode:
             trans_desc = await translate_text(data.get('title', ''))
@@ -116,7 +127,6 @@ async def handle_tiktok(message: types.Message):
             if music_bytes:
                 music_file = BufferedInputFile(music_bytes, filename=music_name)
 
-        # === 1. ФОТО (ВИПРАВЛЕНО) ===
         if has_images:
             await status_msg.edit_text("📸 TikTok: Качаю фото...")
             images_urls = data['images']
@@ -125,8 +135,6 @@ async def handle_tiktok(message: types.Message):
             
             for i in range(0, len(images_urls), chunk_size):
                 chunk_urls = images_urls[i:i + chunk_size]
-                
-                # 🔥 Скачуємо файли в пам'ять, а не кидаємо посилання
                 tasks = [download_content(url) for url in chunk_urls]
                 downloaded_images = await asyncio.gather(*tasks)
                 
@@ -135,9 +143,7 @@ async def handle_tiktok(message: types.Message):
                 
                 for idx, img_bytes in enumerate(downloaded_images):
                     if img_bytes:
-                        # Створюємо файл в пам'яті
                         img_file = BufferedInputFile(img_bytes, filename=f"img_{i}_{idx}.jpg")
-                        
                         if first and images_added == 0 and caption_text:
                             media_group.add_photo(media=img_file, caption=caption_text, parse_mode="HTML")
                         else:
@@ -152,7 +158,6 @@ async def handle_tiktok(message: types.Message):
                 await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
             await status_msg.delete()
 
-        # === 2. ВІДЕО ===
         else:
             await status_msg.edit_text("🎥 TikTok: Відео...")
             vid_url = data.get('hdplay') or data.get('play')
@@ -183,7 +188,6 @@ async def handle_tiktok(message: types.Message):
     except Exception as e:
         logging.error(f"TikTok Error: {e}")
         await status_msg.edit_text("❌ Помилка TikTok (не вдалося скачати медіа).")
-
 
 # === TWITTER / X ===
 @dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
@@ -256,14 +260,12 @@ async def handle_twitter(message: types.Message):
                     return
         else:
             await status_msg.edit_text("⬇️ Twitter: Фото...")
-            # Тут теж краще скачати, про всяк випадок, хоча twitter-лінки живуть довше
             if len(media_list) == 1:
                 p_bytes = await download_content(media_list[0]['url'])
                 if p_bytes:
                     p_file = BufferedInputFile(p_bytes, filename="photo.jpg")
                     await message.answer_photo(p_file, caption=caption_text, parse_mode="HTML")
             else:
-                # Галерея
                 tasks = [download_content(m['url']) for m in media_list]
                 results = await asyncio.gather(*tasks)
                 
@@ -302,8 +304,10 @@ async def start_web_server():
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    # 🔥 Додано keep_alive_ping в список задач
     await asyncio.gather(
         start_web_server(),
+        keep_alive_ping(),
         dp.start_polling(bot)
     )
 
