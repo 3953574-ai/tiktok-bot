@@ -7,8 +7,8 @@ from aiogram.types import BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
-# Підключаємо нову сучасну бібліотеку перекладу
 from deep_translator import GoogleTranslator
+from langdetect import detect, LangDetectException
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -22,7 +22,7 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Налаштовуємо перекладач (з автовизначення на українську)
+# Налаштовуємо перекладач
 translator = GoogleTranslator(source='auto', target='uk')
 
 # --- ФУНКЦІЇ БОТА ---
@@ -40,30 +40,36 @@ async def download_content(url):
     return None
 
 async def create_caption(data, original_url):
-    """Створює підпис з перекладом (Deep Translator)"""
+    """Створює підпис. Англійську не перекладає, інше - українською."""
     author = data.get('author', {})
     nickname = author.get('nickname', 'Unknown')
     unique_id = author.get('unique_id', '') 
     
     original_title = data.get('title', '')
-    translated_title = original_title
+    final_title = original_title
 
-    # --- ПЕРЕКЛАД ---
+    # --- ЛОГІКА МОВИ ---
     if original_title and original_title.strip():
         try:
-            # Виконуємо переклад в окремому потоці, щоб не блокувати бота
-            translated_title = await asyncio.to_thread(translator.translate, original_title)
+            # 1. Визначаємо мову
+            lang = detect(original_title)
+            
+            # 2. Якщо це НЕ англійська -> перекладаємо
+            if lang != 'en':
+                final_title = await asyncio.to_thread(translator.translate, original_title)
+            # Якщо англійська ('en') -> залишаємо original_title
+                
         except Exception as e:
-            logging.error(f"Translation error: {e}")
-            translated_title = original_title
+            logging.error(f"Language detection/translation error: {e}")
+            final_title = original_title # Якщо помилка - лишаємо оригінал
     else:
-        translated_title = ""
+        final_title = ""
 
     # --- ФОРМУВАННЯ ТЕКСТУ ---
     caption = f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
     
-    if translated_title and translated_title.strip():
-        caption += f"📝 {translated_title}\n\n"
+    if final_title and final_title.strip():
+        caption += f"📝 {final_title}\n\n"
     
     caption += f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
     
@@ -74,7 +80,7 @@ async def create_caption(data, original_url):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Надішли мені посилання на TikTok. Я скачаю відео та перекладу опис.")
+    await message.answer("Привіт! Надішли мені посилання на TikTok.")
 
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok_link(message: types.Message):
@@ -92,7 +98,7 @@ async def handle_tiktok_link(message: types.Message):
 
         data = result['data']
         
-        # Формуємо підпис
+        # Підпис
         caption_text = await create_caption(data, user_url)
         
         # Музика
@@ -145,12 +151,20 @@ async def handle_tiktok_link(message: types.Message):
                 thumbnail_file = None
                 if cover_bytes:
                     thumbnail_file = BufferedInputFile(cover_bytes, filename="cover.jpg")
-                
+
+                # 🔥 ВИПРАВЛЕННЯ ДЛЯ ДОВГИХ ВІДЕО
+                # Пробуємо дістати ширину/висоту з кореня об'єкта JSON.
+                # Якщо там будуть числа - Телеграм використає їх і зробить відео прямокутним.
+                vid_width = data.get('width')
+                vid_height = data.get('height')
+
                 await message.answer_video(
                     video_file,
                     caption=caption_text,
                     parse_mode="HTML",
                     thumbnail=thumbnail_file,
+                    width=vid_width,   # Передаємо ширину
+                    height=vid_height, # Передаємо висоту
                     supports_streaming=True
                 )
                 
