@@ -140,7 +140,7 @@ async def cmd_start(message: types.Message):
         f"🍪 <b>YouTube статус:</b> {cookies_status}"
     )
 
-# === YOUTUBE (Fixed Format Selector) ===
+# === YOUTUBE (Robust Format Selection) ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
     user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
@@ -159,20 +159,22 @@ async def handle_youtube(message: types.Message):
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
 
+    # 👇 ГОЛОВНА ЗМІНА: Гнучкий формат
+    # Ми кажемо: "Дай найкраще відео, не більше вказаної якості, у будь-якому форматі".
+    # А потім "merge_output_format" зробить з цього mp4.
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
-        # 👇 ГОЛОВНА ЗМІНА: Більш гнучкий пошук форматів
         'format': f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
-        'merge_output_format': 'mp4', # Примусово пакуємо в MP4
+        'merge_output_format': 'mp4', # 👈 Це магічний рядок, який все фіксить
     }
 
     # Підключаємо куки
     if os.path.exists('cookies.txt'):
         ydl_opts['cookiefile'] = 'cookies.txt'
     else:
-        # Якщо куків немає, пробуємо Android Creator
+        # Fallback
         ydl_opts['extractor_args'] = {
             'youtube': {
                 'player_skip': ['webpage', 'configs', 'js'],
@@ -232,7 +234,7 @@ async def handle_youtube(message: types.Message):
         if "Sign in" in err_msg:
              await status_msg.edit_text("❌ YouTube вимагає оновлення cookies.txt.")
         elif "Requested format is not available" in err_msg:
-             await status_msg.edit_text("❌ Така якість недоступна для цього відео.")
+             await status_msg.edit_text("❌ Формат недоступний. Спробуй іншу якість.")
         else:
              await status_msg.edit_text("❌ Помилка завантаження.")
         
