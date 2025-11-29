@@ -4,6 +4,7 @@ import os
 import asyncio
 import re
 import glob
+import random
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, BufferedInputFile
@@ -16,7 +17,7 @@ import instaloader
 import yt_dlp
 import static_ffmpeg
 
-# Активуємо FFmpeg для нарізки
+# Активуємо FFmpeg
 static_ffmpeg.add_paths()
 
 # --- КОНФІГУРАЦІЯ ---
@@ -24,7 +25,14 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Логи
+# Список дзеркал Cobalt (для запасного варіанту)
+COBALT_MIRRORS = [
+    "https://co.wuk.sh/api/json",
+    "https://api.cobalt.tools/api/json",
+    "https://cobalt.pub/api/json",
+    "https://api.succoon.com/api/json"
+]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -77,9 +85,7 @@ def parse_message_data(text):
 async def download_content(url):
     if not url: return None
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
                 if response.status == 200:
@@ -104,6 +110,33 @@ def format_caption(nickname, username, profile_url, title, original_url):
     caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
     if len(caption) > 1024: caption = caption[:1000] + "..."
     return caption
+
+# --- ЗАПАСНИЙ ВАРІАНТ: COBALT ---
+async def try_cobalt_download(user_url):
+    logging.info("Trying Cobalt Fallback...")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+    }
+    payload = {"url": user_url, "videoQuality": "720"}
+    
+    async with aiohttp.ClientSession() as session:
+        for mirror in COBALT_MIRRORS:
+            try:
+                async with session.post(mirror, json=payload, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('status') in ['stream', 'redirect']:
+                            video_url = data.get('url')
+                            if video_url:
+                                video_bytes = await download_content(video_url)
+                                if video_bytes:
+                                    return video_bytes, "Cobalt API"
+            except Exception as e:
+                logging.warning(f"Cobalt mirror {mirror} failed: {e}")
+                continue
+    return None, None
 
 # --- ФОНОВІ ЗАДАЧІ ---
 async def keep_alive_ping():
@@ -134,17 +167,9 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привіт! Я качаю з:\n"
-        "🎵 <b>TikTok</b>\n"
-        "📸 <b>Instagram</b>\n"
-        "🐦 <b>Twitter (X)</b>\n"
-        "📺 <b>YouTube</b>\n\n"
-        "✂️ <b>Нарізка:</b> посилання + <code>cut 00:10-00:15</code>",
-        parse_mode="HTML"
-    )
+    await message.answer("Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.")
 
-# === YOUTUBE (ANTI-BOT BYPASS) ===
+# === YOUTUBE (SUPER LOGIC / CHAMELEON) ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
     user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
@@ -152,66 +177,98 @@ async def handle_youtube(message: types.Message):
 
     action_text = f"Завантажую ({quality}p)..."
     if cut_range:
-        duration = cut_range[1] - cut_range[0]
-        if duration > 300:
+        if (cut_range[1] - cut_range[0]) > 300:
             await message.reply("✂️ Максимум 5 хвилин для нарізки.")
             return
-        action_text = f"Вирізаю шматок ({duration}с)..."
+        action_text = "Вирізаю шматок..."
         
     status_msg = await message.reply(f"📺 YouTube: {action_text}")
 
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
 
-    # Формуємо рядок формату
-    format_str = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    # Стратегія "Хамелеон": список клієнтів для спроб
+    # 1. TV (найменше блокується)
+    # 2. Android (стандарт)
+    # 3. iOS (іноді працює, коли інші ні)
+    clients_to_try = ['tv', 'android', 'ios']
+    
+    file_path = None
+    info_dict = None
+    download_success = False
 
-    ydl_opts = {
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'format': format_str,
-        # 👇 ГОЛОВНИЙ ФІКС: Ігноруємо веб-версію, йдемо тільки через Android API
-        'extractor_args': {
-            'youtube': {
-                'player_skip': ['webpage', 'configs', 'js'], 
-                'player_client': ['android', 'ios'],
-            }
-        },
-    }
+    # Спроба скачати через yt-dlp з різними клієнтами
+    for client in clients_to_try:
+        logging.info(f"📺 Trying YouTube with client: {client}")
+        
+        ydl_opts = {
+            'outtmpl': 'downloads/%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'format': f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            'extractor_args': {
+                'youtube': {
+                    'player_skip': ['webpage', 'configs', 'js'],
+                    'player_client': [client],
+                }
+            },
+        }
 
-    if audio_mode and not cut_range:
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
-        ydl_opts['outtmpl'] = 'downloads/%(id)s.mp3'
+        # Аудіо режим
+        if audio_mode and not cut_range:
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
+            ydl_opts['outtmpl'] = 'downloads/%(id)s.mp3'
 
-    if cut_range:
-        ydl_opts['download_ranges'] = lambda info, ydl: [{'start_time': cut_range[0], 'end_time': cut_range[1]}]
-        ydl_opts['force_keyframes_at_cuts'] = True 
+        # Нарізка
+        if cut_range:
+            ydl_opts['download_ranges'] = lambda info, ydl: [{'start_time': cut_range[0], 'end_time': cut_range[1]}]
+            ydl_opts['force_keyframes_at_cuts'] = True 
 
+        try:
+            loop = asyncio.get_event_loop()
+            def download_task(opts):
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(user_url, download=True)
+
+            info_dict = await loop.run_in_executor(None, download_task, ydl_opts)
+            file_id = info_dict.get('id')
+            files = glob.glob(f"downloads/{file_id}*")
+            
+            if files:
+                file_path = files[0]
+                download_success = True
+                logging.info(f"✅ Success with client: {client}")
+                break # Виходимо з циклу, якщо вийшло
+        except Exception as e:
+            logging.warning(f"❌ Client {client} failed: {e}")
+            continue
+
+    # ПЛАН "Б": Якщо yt-dlp не впорався, пробуємо Cobalt (Тільки для повних відео)
+    if not download_success and not cut_range and not audio_mode:
+        logging.info("⚠️ yt-dlp failed. Switching to Cobalt Fallback...")
+        video_bytes, author_cobalt = await try_cobalt_download(user_url)
+        if video_bytes:
+            # Зберігаємо в файл
+            file_path = "downloads/cobalt_video.mp4"
+            with open(file_path, "wb") as f:
+                f.write(video_bytes)
+            download_success = True
+            info_dict = {'uploader': 'YouTube (via Cobalt)', 'title': 'Video'}
+
+    # Фінальна перевірка
+    if not download_success or not file_path:
+        await status_msg.edit_text("❌ YouTube заблокував усі спроби. Спробуй пізніше.")
+        return
+
+    # Відправка файлу
     try:
-        loop = asyncio.get_event_loop()
-        def download_task():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(user_url, download=True)
-
-        info_dict = await loop.run_in_executor(None, download_task)
-        file_id = info_dict.get('id')
-        files = glob.glob(f"downloads/{file_id}*")
-        
-        if not files:
-            await status_msg.edit_text("❌ YouTube: Не вдалося скачати файл.")
-            return
-
-        file_path = files[0]
-        
         caption_text = None
-        if not clean_mode:
+        if not clean_mode and info_dict:
             title = info_dict.get('title', '')
             trans_title = await translate_text(title)
             author = info_dict.get('uploader', 'YouTube')
-            res_info = f"{quality}p" if not audio_mode else "Audio"
-            caption_text = f"📺 <b>{author}</b> ({res_info})\n\n📝 {trans_title}\n\n🔗 <a href='{user_url}'>YouTube</a>"
+            caption_text = f"📺 <b>{author}</b>\n\n📝 {trans_title}\n\n🔗 <a href='{user_url}'>YouTube</a>"
 
         input_file = FSInputFile(file_path)
 
@@ -223,40 +280,30 @@ async def handle_youtube(message: types.Message):
                  audio_file = FSInputFile(file_path, filename="cut_audio.mp3")
                  await message.answer_audio(audio_file, caption="🎵 Звук")
 
-        await status_msg.delete()
-        os.remove(file_path)
-
     except Exception as e:
-        logging.error(f"YouTube Error: {e}")
-        err_msg = str(e)
-        if "Sign in" in err_msg:
-             await status_msg.edit_text("❌ YouTube вимагає входу (спробуй пізніше або інше відео).")
-        else:
-             await status_msg.edit_text("❌ Помилка завантаження.")
-        
-        for f in glob.glob(f"downloads/*"):
-            try: os.remove(f)
-            except: pass
+        logging.error(f"Sending Error: {e}")
+        await status_msg.edit_text("❌ Помилка при відправці.")
+    finally:
+        await status_msg.delete()
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 # === INSTAGRAM ===
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
     user_url, clean_mode, audio_mode, _, _ = parse_message_data(message.text)
     if not user_url: return
-
     status_msg = await message.reply("📸 Instagram: Аналізую...")
     shortcode_match = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url)
     if not shortcode_match:
         await status_msg.edit_text("❌ Instagram: Не зрозумів посилання.")
         return
     shortcode = shortcode_match.group(1)
-
     try:
         def get_insta_data(code):
             L = instaloader.Instaloader(quiet=True)
             L.context._user_agent = "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 446464522)"
             return instaloader.Post.from_shortcode(L.context, code)
-
         post = await asyncio.to_thread(get_insta_data, shortcode)
         caption_text = None
         if not clean_mode:
@@ -265,7 +312,6 @@ async def handle_instagram(message: types.Message):
             trans_desc = await translate_text(raw_caption)
             author = post.owner_username
             caption_text = f"👤 <b>{author}</b>\n\n📝 {trans_desc}\n\n🔗 <a href='{user_url}'>Оригінал</a>"
-
         media_group = MediaGroupBuilder()
         tasks = []
         if post.typename == 'GraphSidecar':
@@ -276,7 +322,6 @@ async def handle_instagram(message: types.Message):
         else:
             if post.is_video: tasks.append((download_content(post.video_url), 'video'))
             else: tasks.append((download_content(post.url), 'photo'))
-
         results = await asyncio.gather(*[t[0] for t in tasks])
         files_added = 0
         if len(results) == 1 and results[0]:
