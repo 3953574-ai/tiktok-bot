@@ -1,18 +1,19 @@
 import logging
 import os
 import asyncio
+import re
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
 from deep_translator import GoogleTranslator
-from langdetect import detect, LangDetectException
+from langdetect import detect
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-API_URL = "https://www.tikwm.com/api/"
+TIKTOK_API_URL = "https://www.tikwm.com/api/"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -21,10 +22,10 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
 translator = GoogleTranslator(source='auto', target='uk')
 
-# --- ФУНКЦІЇ БОТА ---
+# --- ДОПОМІЖНІ ФУНКЦІЇ ---
+
 async def download_content(url):
     """Скачує файл за посиланням"""
     if not url:
@@ -38,69 +39,75 @@ async def download_content(url):
         logging.error(f"Error downloading {url}: {e}")
     return None
 
-async def create_caption(data, original_url):
-    """Створює підпис з перекладом"""
-    author = data.get('author', {})
-    nickname = author.get('nickname', 'Unknown')
-    unique_id = author.get('unique_id', '') 
-    
-    original_title = data.get('title', '')
-    final_title = original_title
+async def translate_text(text):
+    """Перекладає текст на українську, якщо він не англійською"""
+    if not text or not text.strip():
+        return ""
+    try:
+        lang = detect(text)
+        if lang != 'en':
+            return await asyncio.to_thread(translator.translate, text)
+    except Exception as e:
+        # Якщо помилка детекції або перекладу - повертаємо оригінал
+        logging.error(f"Translation error: {e}")
+    return text
 
-    # Логіка перекладу
-    if original_title and original_title.strip():
-        try:
-            lang = detect(original_title)
-            if lang != 'en':
-                final_title = await asyncio.to_thread(translator.translate, original_title)
-        except Exception as e:
-            logging.error(f"Translation error: {e}")
-            final_title = original_title
-    else:
-        final_title = ""
-
-    caption = f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
-    if final_title and final_title.strip():
-        caption += f"📝 {final_title}\n\n"
-    caption += f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
+def format_caption(nickname, username, title, original_url):
+    """Формує підпис"""
+    caption = f"👤 <b>{nickname}</b> (@{username})\n\n"
+    if title:
+        caption += f"📝 {title}\n\n"
+    caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
     
     if len(caption) > 1024:
         caption = caption[:1000] + "..."
     return caption
 
+# --- ОБРОБНИКИ ---
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Надішли мені посилання на TikTok.")
+    await message.answer("Привіт! Я качаю з TikTok та Twitter (X).\nВідео, фото, галереї — все вмію.")
 
+# === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
-async def handle_tiktok_link(message: types.Message):
+async def handle_tiktok(message: types.Message):
     user_url = message.text.strip()
-    status_msg = await message.reply("⏳ Обробляю...")
+    status_msg = await message.reply("🎵 TikTok: Обробляю...")
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(API_URL, data={'url': user_url, 'hd': 1}) as response:
+            async with session.post(TIKTOK_API_URL, data={'url': user_url, 'hd': 1}) as response:
                 result = await response.json()
 
         if result.get('code') != 0:
-            await status_msg.edit_text("❌ Не вдалося завантажити. Перевірте посилання.")
+            await status_msg.edit_text("❌ TikTok: Не вдалося знайти.")
             return
 
         data = result['data']
-        caption_text = await create_caption(data, user_url)
         
+        # Текст
+        orig_desc = data.get('title', '')
+        trans_desc = await translate_text(orig_desc)
+        
+        author = data.get('author', {})
+        caption_text = format_caption(
+            author.get('nickname', 'User'),
+            author.get('unique_id', ''),
+            trans_desc,
+            user_url
+        )
+
         # Музика
         music_url = data.get('music')
         music_bytes = await download_content(music_url)
         music_info = data.get('music_info', {})
-        music_title = music_info.get('title', 'original sound')
-        music_author = music_info.get('author', 'TikTok')
-        music_filename = f"{music_author} - {music_title}.mp3"
-        music_file = BufferedInputFile(music_bytes, filename=music_filename) if music_bytes else None
+        music_name = f"{music_info.get('author','')} - {music_info.get('title','')}.mp3"
+        music_file = BufferedInputFile(music_bytes, filename=music_name) if music_bytes else None
 
-        # --- ФОТО ---
+        # 1. Слайдер (Фото)
         if 'images' in data and data['images']:
-            await status_msg.edit_text("📸 Завантажую фото...")
+            await status_msg.edit_text("📸 TikTok: Вантажу фото...")
             images = data['images']
             chunk_size = 10
             
@@ -118,66 +125,145 @@ async def handle_tiktok_link(message: types.Message):
                 first_album = False
             
             if music_file:
-                await message.answer_audio(music_file, caption=f"🎵 {music_title}")
+                await message.answer_audio(music_file, caption="🎵 Звук")
             await status_msg.delete()
 
-        # --- ВІДЕО ---
+        # 2. Відео
         else:
-            await status_msg.edit_text("🎥 Завантажую відео...")
-            
-            video_url = data.get('hdplay') or data.get('play')
+            await status_msg.edit_text("🎥 TikTok: Вантажу відео...")
+            vid_url = data.get('hdplay') or data.get('play')
             cover_url = data.get('origin_cover') or data.get('cover')
-
-            video_bytes, cover_bytes = await asyncio.gather(
-                download_content(video_url),
+            
+            vid_bytes, cover_bytes = await asyncio.gather(
+                download_content(vid_url),
                 download_content(cover_url)
             )
 
-            if video_bytes:
-                video_file = BufferedInputFile(video_bytes, filename=f"video_{data['id']}.mp4")
+            if vid_bytes:
+                vfile = BufferedInputFile(vid_bytes, filename=f"tk_{data['id']}.mp4")
+                tfile = BufferedInputFile(cover_bytes, filename="cover.jpg") if cover_bytes else None
                 
-                thumbnail_file = None
-                if cover_bytes:
-                    thumbnail_file = BufferedInputFile(cover_bytes, filename="cover.jpg")
-
-                # 🔥 HARD FIX ДЛЯ КВАДРАТНИХ ВІДЕО 🔥
-                # 1. Пробуємо взяти реальні розміри
-                width = data.get('width')
-                height = data.get('height')
-                
-                # Перетворюємо в int безпечно
+                # Hard fix розмірів
+                w, h = 720, 1280
                 try:
-                    width = int(width)
-                    height = int(height)
-                except (ValueError, TypeError):
-                    width = None
-                    height = None
-
-                # 2. Якщо розмірів немає АБО це велике відео і телеграм тупить
-                # Примусово ставимо вертикальний формат (стандарт TikTok)
-                if not width or not height:
-                    width = 720
-                    height = 1280
+                    w = int(data.get('width'))
+                    h = int(data.get('height'))
+                except: pass
                 
                 await message.answer_video(
-                    video_file,
-                    caption=caption_text,
-                    parse_mode="HTML",
-                    thumbnail=thumbnail_file,
-                    width=width,    # Явно передаємо ширину
-                    height=height,  # Явно передаємо висоту
-                    supports_streaming=True
+                    vfile, caption=caption_text, parse_mode="HTML",
+                    thumbnail=tfile, width=w, height=h, supports_streaming=True
                 )
-                
                 if music_file:
-                    await message.answer_audio(music_file, caption=f"🎵 {music_title}")
+                    await message.answer_audio(music_file, caption="🎵 Звук")
                 await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ Помилка: файл відео не знайдено.")
 
     except Exception as e:
-        logging.error(f"Main Loop Error: {e}")
-        await status_msg.edit_text("❌ Сталася помилка.")
+        logging.error(f"TikTok Error: {e}")
+        await status_msg.edit_text("❌ Помилка TikTok.")
+
+
+# === TWITTER / X (API) ===
+@dp.message(F.text.regexp(r"(twitter\.com|x\.com)/.+/status/\d+"))
+async def handle_twitter(message: types.Message):
+    user_url = message.text.strip()
+    status_msg = await message.reply("🐦 Twitter: Аналізую...")
+
+    # Витягуємо ID твіта
+    match = re.search(r"/status/(\d+)", user_url)
+    if not match:
+        await status_msg.edit_text("❌ Не можу знайти ID твіта.")
+        return
+    tweet_id = match.group(1)
+
+    # Використовуємо API FxTwitter
+    api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as response:
+                if response.status != 200:
+                    await status_msg.edit_text("❌ Твіт не знайдено (можливо, приватний).")
+                    return
+                json_data = await response.json()
+
+        tweet = json_data.get('tweet', {})
+        if not tweet:
+            await status_msg.edit_text("❌ Помилка отримання даних.")
+            return
+
+        # Текст
+        text = tweet.get('text', '')
+        trans_text = await translate_text(text)
+        
+        author = tweet.get('author', {})
+        caption_text = format_caption(
+            author.get('name', 'User'),
+            author.get('screen_name', 'twitter'),
+            trans_text,
+            user_url
+        )
+
+        media_list = tweet.get('media', {}).get('all', [])
+        
+        if not media_list:
+            # Тільки текст
+            await message.answer(caption_text, parse_mode="HTML", disable_web_page_preview=True)
+            await status_msg.delete()
+            return
+
+        # Перевіряємо тип контенту
+        # Twitter API зазвичай групує або фото, або відео (змішаних майже не буває)
+        
+        has_video = any(m['type'] == 'video' or m['type'] == 'gif' for m in media_list)
+
+        if has_video:
+            await status_msg.edit_text("⬇️ Twitter: Вантажу відео...")
+            # Беремо перше відео (у твіті зазвичай одне відео)
+            video_data = next((m for m in media_list if m['type'] in ['video', 'gif']), None)
+            
+            if video_data:
+                video_bytes = await download_content(video_data['url'])
+                if video_bytes:
+                    vfile = BufferedInputFile(video_bytes, filename=f"tw_{tweet_id}.mp4")
+                    # Звук (беремо те саме відео як аудіо)
+                    afile = BufferedInputFile(video_bytes, filename=f"tw_audio_{tweet_id}.mp3")
+                    
+                    # Спробуємо взяти розміри
+                    w = video_data.get('width')
+                    h = video_data.get('height')
+                    
+                    await message.answer_video(
+                        vfile, caption=caption_text, parse_mode="HTML",
+                        width=w, height=h, supports_streaming=True
+                    )
+                    await message.answer_audio(afile, caption="🎵 Звук з твіта")
+                    await status_msg.delete()
+                    return
+
+        else:
+            # Це фото (може бути декілька)
+            await status_msg.edit_text("⬇️ Twitter: Вантажу фото...")
+            
+            # Якщо фото одне - просто send_photo
+            # Якщо кілька - MediaGroup
+            if len(media_list) == 1:
+                photo_url = media_list[0]['url']
+                await message.answer_photo(photo_url, caption=caption_text, parse_mode="HTML")
+            else:
+                media_group = MediaGroupBuilder()
+                for i, m in enumerate(media_list):
+                    if i == 0:
+                        media_group.add_photo(media=m['url'], caption=caption_text, parse_mode="HTML")
+                    else:
+                        media_group.add_photo(media=m['url'])
+                await message.answer_media_group(media_group.build())
+            
+            await status_msg.delete()
+
+    except Exception as e:
+        logging.error(f"Twitter Handler Error: {e}")
+        await status_msg.edit_text("❌ Щось пішло не так.")
 
 # --- ВЕБ-СЕРВЕР ---
 async def health_check(request):
