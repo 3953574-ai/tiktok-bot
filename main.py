@@ -4,7 +4,7 @@ import asyncio
 import re
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo
+from aiogram.types import BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
@@ -48,7 +48,6 @@ async def translate_text(text):
         if lang != 'en':
             return await asyncio.to_thread(translator.translate, text)
     except Exception as e:
-        # Якщо помилка детекції або перекладу - повертаємо оригінал
         logging.error(f"Translation error: {e}")
     return text
 
@@ -67,7 +66,7 @@ def format_caption(nickname, username, title, original_url):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Я качаю з TikTok та Twitter (X).\nВідео, фото, галереї — все вмію.")
+    await message.answer("Привіт! Я качаю з TikTok та Twitter (X).")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
@@ -149,7 +148,8 @@ async def handle_tiktok(message: types.Message):
                     w = int(data.get('width'))
                     h = int(data.get('height'))
                 except: pass
-                
+                if not w or not h: w, h = 720, 1280
+
                 await message.answer_video(
                     vfile, caption=caption_text, parse_mode="HTML",
                     thumbnail=tfile, width=w, height=h, supports_streaming=True
@@ -163,20 +163,19 @@ async def handle_tiktok(message: types.Message):
         await status_msg.edit_text("❌ Помилка TikTok.")
 
 
-# === TWITTER / X (API) ===
-@dp.message(F.text.regexp(r"(twitter\.com|x\.com)/.+/status/\d+"))
+# === TWITTER / X (Виправлено фільтр) ===
+@dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
 async def handle_twitter(message: types.Message):
     user_url = message.text.strip()
     status_msg = await message.reply("🐦 Twitter: Аналізую...")
 
-    # Витягуємо ID твіта
+    # Шукаємо цифри після /status/ незалежно від сміття навколо
     match = re.search(r"/status/(\d+)", user_url)
     if not match:
-        await status_msg.edit_text("❌ Не можу знайти ID твіта.")
+        await status_msg.edit_text("❌ Не можу знайти ID твіта в посиланні.")
         return
     tweet_id = match.group(1)
 
-    # Використовуємо API FxTwitter
     api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
 
     try:
@@ -189,7 +188,7 @@ async def handle_twitter(message: types.Message):
 
         tweet = json_data.get('tweet', {})
         if not tweet:
-            await status_msg.edit_text("❌ Помилка отримання даних.")
+            await status_msg.edit_text("❌ Помилка API Twitter.")
             return
 
         # Текст
@@ -207,29 +206,22 @@ async def handle_twitter(message: types.Message):
         media_list = tweet.get('media', {}).get('all', [])
         
         if not media_list:
-            # Тільки текст
             await message.answer(caption_text, parse_mode="HTML", disable_web_page_preview=True)
             await status_msg.delete()
             return
 
-        # Перевіряємо тип контенту
-        # Twitter API зазвичай групує або фото, або відео (змішаних майже не буває)
-        
-        has_video = any(m['type'] == 'video' or m['type'] == 'gif' for m in media_list)
+        has_video = any(m['type'] in ['video', 'gif'] for m in media_list)
 
         if has_video:
             await status_msg.edit_text("⬇️ Twitter: Вантажу відео...")
-            # Беремо перше відео (у твіті зазвичай одне відео)
             video_data = next((m for m in media_list if m['type'] in ['video', 'gif']), None)
             
             if video_data:
                 video_bytes = await download_content(video_data['url'])
                 if video_bytes:
                     vfile = BufferedInputFile(video_bytes, filename=f"tw_{tweet_id}.mp4")
-                    # Звук (беремо те саме відео як аудіо)
                     afile = BufferedInputFile(video_bytes, filename=f"tw_audio_{tweet_id}.mp3")
                     
-                    # Спробуємо взяти розміри
                     w = video_data.get('width')
                     h = video_data.get('height')
                     
@@ -242,11 +234,7 @@ async def handle_twitter(message: types.Message):
                     return
 
         else:
-            # Це фото (може бути декілька)
             await status_msg.edit_text("⬇️ Twitter: Вантажу фото...")
-            
-            # Якщо фото одне - просто send_photo
-            # Якщо кілька - MediaGroup
             if len(media_list) == 1:
                 photo_url = media_list[0]['url']
                 await message.answer_photo(photo_url, caption=caption_text, parse_mode="HTML")
@@ -263,7 +251,7 @@ async def handle_twitter(message: types.Message):
 
     except Exception as e:
         logging.error(f"Twitter Handler Error: {e}")
-        await status_msg.edit_text("❌ Щось пішло не так.")
+        await status_msg.edit_text("❌ Помилка завантаження.")
 
 # --- ВЕБ-СЕРВЕР ---
 async def health_check(request):
