@@ -14,7 +14,8 @@ from langdetect import detect
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
-# 👇 ВСТАВ СЮДИ СВОЄ ПОСИЛАННЯ З RENDER
+COBALT_API_URL = "https://api.cobalt.tools/api/json" # 🆕 API для Instagram
+# 👇 Твоє посилання з Render
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
 logging.basicConfig(level=logging.INFO)
@@ -71,7 +72,7 @@ def format_caption(nickname, username, profile_url, title, original_url):
 # --- САМО-ПІНГ (ЩОБ НЕ СПАВ) ---
 async def keep_alive_ping():
     while True:
-        await asyncio.sleep(180)  # ⏳ 3 хвилини (180 секунд)
+        await asyncio.sleep(180)  # ⏳ 3 хвилини
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL) as response:
@@ -83,7 +84,100 @@ async def keep_alive_ping():
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Я качаю з TikTok та Twitter (X).")
+    await message.answer("Привіт! Я качаю з TikTok, Twitter (X) та Instagram 📸.")
+
+# === INSTAGRAM (НОВЕ) ===
+@dp.message(F.text.contains("instagram.com"))
+async def handle_instagram(message: types.Message):
+    user_url, clean_mode, audio_mode = parse_message_data(message.text)
+    if not user_url: return
+
+    status_msg = await message.reply("📸 Instagram: Обробляю...")
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {"url": user_url}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(COBALT_API_URL, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    await status_msg.edit_text("❌ Instagram: Не вдалося отримати дані.")
+                    return
+                data = await response.json()
+
+        if data.get('status') == 'error':
+            await status_msg.edit_text("❌ Instagram: Помилка (можливо, профіль закритий).")
+            return
+
+        # Підпис (Cobalt на жаль рідко віддає опис і автора, тому робимо простий)
+        caption_text = None
+        if not clean_mode:
+            caption_text = f"🔗 <a href='{user_url}'>Оригінал Instagram</a>"
+
+        # Обробка результату
+        # 1. Один файл (Відео або Фото)
+        if data.get('status') == 'stream' or (data.get('status') == 'redirect'):
+            media_url = data.get('url')
+            media_bytes = await download_content(media_url)
+            
+            if media_bytes:
+                # Спробуємо вгадати розширення по URL або просто mp4
+                is_video = ".mp4" in media_url or "video" in data.get('filename', '')
+                filename = "insta_video.mp4" if is_video else "insta_photo.jpg"
+                file = BufferedInputFile(media_bytes, filename=filename)
+
+                if is_video:
+                    await message.answer_video(file, caption=caption_text, parse_mode="HTML")
+                    if audio_mode:
+                        afile = BufferedInputFile(media_bytes, filename="insta_audio.mp3")
+                        await message.answer_audio(afile, caption="🎵 Звук з Reels")
+                else:
+                    await message.answer_photo(file, caption=caption_text, parse_mode="HTML")
+                
+                await status_msg.delete()
+                return
+
+        # 2. Карусель (Picker) - багато фото/відео
+        elif data.get('status') == 'picker':
+            await status_msg.edit_text("📸 Instagram: Качаю галерею...")
+            items = data.get('picker', [])
+            
+            # Скачуємо всі елементи
+            media_group = MediaGroupBuilder()
+            tasks = [download_content(item['url']) for item in items]
+            results = await asyncio.gather(*tasks)
+
+            added_count = 0
+            for idx, content_bytes in enumerate(results):
+                if content_bytes:
+                    item_type = items[idx].get('type') # 'photo' or 'video'
+                    if item_type == 'video':
+                         m_file = BufferedInputFile(content_bytes, filename=f"inst_{idx}.mp4")
+                         if added_count == 0 and caption_text:
+                             media_group.add_video(media=m_file, caption=caption_text, parse_mode="HTML")
+                         else:
+                             media_group.add_video(media=m_file)
+                    else:
+                         m_file = BufferedInputFile(content_bytes, filename=f"inst_{idx}.jpg")
+                         if added_count == 0 and caption_text:
+                             media_group.add_photo(media=m_file, caption=caption_text, parse_mode="HTML")
+                         else:
+                             media_group.add_photo(media=m_file)
+                    added_count += 1
+            
+            if added_count > 0:
+                await message.answer_media_group(media_group.build())
+                await status_msg.delete()
+                return
+
+        await status_msg.edit_text("❌ Instagram: Формат не підтримується.")
+
+    except Exception as e:
+        logging.error(f"Instagram Error: {e}")
+        await status_msg.edit_text("❌ Помилка Instagram.")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
@@ -304,7 +398,6 @@ async def start_web_server():
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # 🔥 Додано keep_alive_ping в список задач
     await asyncio.gather(
         start_web_server(),
         keep_alive_ping(),
