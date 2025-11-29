@@ -108,12 +108,10 @@ async def handle_tiktok_link(message: types.Message):
         else:
             await status_msg.edit_text("🎥 Завантажую відео...")
             
-            # 🔥 БЕРЕМО HD ВЕРСІЮ (ОРИГІНАЛ)
-            # hdplay - це оригінал без стиснення (зазвичай 1080p або 720p)
-            # play - це іноді стиснена версія
+            # Беремо HD версію
             video_url = data.get('hdplay') or data.get('play')
             
-            # Беремо оригінальну обкладинку
+            # Беремо оригінальну обкладинку (щоб відео було вертикальним)
             cover_url = data.get('origin_cover') or data.get('cover')
 
             video_bytes, cover_bytes = await asyncio.gather(
@@ -128,17 +126,14 @@ async def handle_tiktok_link(message: types.Message):
                 if cover_bytes:
                     thumbnail_file = BufferedInputFile(cover_bytes, filename="cover.jpg")
 
-                # Отримуємо розміри відео з даних API
-                width = data.get('hd_size', {}).get('width') or data.get('size', {}).get('width')
-                height = data.get('hd_size', {}).get('height') or data.get('size', {}).get('height')
-
+                # Ми прибрали width/height, бо вони викликали помилку.
+                # Але origin_cover сам має підказати телеграму правильну форму.
+                
                 await message.answer_video(
                     video_file,
                     caption=caption_text,
                     parse_mode="HTML",
                     thumbnail=thumbnail_file,
-                    width=width,   # Прямо вказуємо телеграму ширину
-                    height=height, # і висоту
                     supports_streaming=True
                 )
                 
@@ -167,10 +162,7 @@ async def start_web_server():
     logging.info(f"Web server started on port {port}")
 
 async def main():
-    # Запускаємо веб-сервер і бота
-    # Видаляємо вебхук перед поллінгом, щоб уникнути конфліктів
     await bot.delete_webhook(drop_pending_updates=True)
-    
     await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot)
