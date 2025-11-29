@@ -15,13 +15,15 @@ from langdetect import detect
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 
-# 👇 ЗМІНЕНО: Використовуємо дзеркало Cobalt, бо офіційний блокує Render
-COBALT_API_URL = "https://cobalt.pub/api/json" 
-# Запасні варіанти, якщо цей перестане працювати:
-# "https://co.wuk.sh/api/json"
-# "https://api.succoon.com/api/json"
+# 👇 СПИСОК СЕРВЕРІВ (Бот буде перебирати їх по черзі)
+COBALT_INSTANCES = [
+    "https://co.wuk.sh/api/json",       # Дуже стабільний
+    "https://api.succoon.com/api/json", # Запасний
+    "https://cobalt.tools/api/json",    # Ще один
+    "https://api.cobalt.tools/api/json" # Офіційний (останній шанс)
+]
 
-# 👇 Твоє посилання з Render (для само-пінгу)
+# 👇 Твоє посилання з Render
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
 logging.basicConfig(level=logging.INFO)
@@ -50,7 +52,6 @@ def parse_message_data(text):
 async def download_content(url):
     if not url: return None
     try:
-        # 👇 ЗМІНЕНО: Додаємо User-Agent, щоб не блокували скачування
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
@@ -79,10 +80,10 @@ def format_caption(nickname, username, profile_url, title, original_url):
     if len(caption) > 1024: caption = caption[:1000] + "..."
     return caption
 
-# --- САМО-ПІНГ (ЩОБ НЕ СПАВ) ---
+# --- САМО-ПІНГ ---
 async def keep_alive_ping():
     while True:
-        await asyncio.sleep(180)  # ⏳ 3 хвилини
+        await asyncio.sleep(180)  # 3 хвилини
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL) as response:
@@ -96,44 +97,53 @@ async def keep_alive_ping():
 async def cmd_start(message: types.Message):
     await message.answer("Привіт! Я качаю з TikTok, Twitter (X) та Instagram 📸.")
 
-# === INSTAGRAM (ВИПРАВЛЕНО) ===
+# === INSTAGRAM (MULTI-SERVER) ===
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
     user_url, clean_mode, audio_mode = parse_message_data(message.text)
     if not user_url: return
 
-    status_msg = await message.reply("📸 Instagram: Обробляю...")
+    status_msg = await message.reply("📸 Instagram: Шукаю робочий сервер...")
 
-    # 👇 ЗМІНЕНО: Додаємо заголовки, щоб прикинутись браузером
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     payload = {"url": user_url}
+    
+    data = None
+    success_server = None
+
+    # 🔄 ЦИКЛ: Пробуємо сервери по черзі
+    async with aiohttp.ClientSession() as session:
+        for api_url in COBALT_INSTANCES:
+            try:
+                async with session.post(api_url, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('status') != 'error':
+                            success_server = api_url
+                            break # Знайшли робочий! Виходимо з циклу
+            except Exception as e:
+                logging.warning(f"Server {api_url} failed: {e}")
+                continue
+    
+    if not data or data.get('status') == 'error':
+        await status_msg.edit_text("❌ Instagram: Всі сервери зайняті або профіль закритий.")
+        return
+
+    # Якщо дійшли сюди - значить скачали
+    if success_server:
+        logging.info(f"Instagram success via: {success_server}")
+        await status_msg.edit_text("📸 Instagram: Завантажую медіа...")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(COBALT_API_URL, json=payload, headers=headers) as response:
-                if response.status != 200:
-                    # Спробуємо прочитати помилку, якщо є
-                    try:
-                        err_text = await response.text()
-                        logging.error(f"Instagram API Fail: {response.status} - {err_text}")
-                    except: pass
-                    await status_msg.edit_text("❌ Instagram: Сервер перевантажений або блокує запит.")
-                    return
-                data = await response.json()
-
-        if data.get('status') == 'error':
-            await status_msg.edit_text("❌ Instagram: Помилка (можливо, профіль закритий).")
-            return
-
         caption_text = None
         if not clean_mode:
             caption_text = f"🔗 <a href='{user_url}'>Оригінал Instagram</a>"
 
-        # 1. Одиночний файл
+        # 1. Один файл
         if data.get('status') == 'stream' or (data.get('status') == 'redirect'):
             media_url = data.get('url')
             media_bytes = await download_content(media_url)
@@ -154,11 +164,9 @@ async def handle_instagram(message: types.Message):
                 await status_msg.delete()
                 return
 
-        # 2. Галерея (Picker)
+        # 2. Галерея
         elif data.get('status') == 'picker':
-            await status_msg.edit_text("📸 Instagram: Качаю галерею...")
             items = data.get('picker', [])
-            
             media_group = MediaGroupBuilder()
             tasks = [download_content(item['url']) for item in items]
             results = await asyncio.gather(*tasks)
@@ -190,7 +198,7 @@ async def handle_instagram(message: types.Message):
 
     except Exception as e:
         logging.error(f"Instagram Error: {e}")
-        await status_msg.edit_text("❌ Помилка Instagram.")
+        await status_msg.edit_text("❌ Помилка обробки Instagram.")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
