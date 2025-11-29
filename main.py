@@ -7,7 +7,7 @@ from aiogram.types import BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
-from googletrans import Translator  # Підключаємо перекладач
+from googletrans import Translator
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -20,7 +20,7 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-translator = Translator() # Створюємо об'єкт перекладача
+translator = Translator()
 
 # --- ФУНКЦІЇ БОТА ---
 async def download_content(url):
@@ -37,45 +37,50 @@ async def download_content(url):
     return None
 
 async def create_caption(data, original_url):
-    """Створює гарний підпис з перекладом"""
+    """Створює розумний підпис: якщо опису немає, блок пропускається"""
     author = data.get('author', {})
     nickname = author.get('nickname', 'Unknown')
     unique_id = author.get('unique_id', '') 
     
-    # Отримуємо оригінальний текст
     original_title = data.get('title', '')
     translated_title = original_title
 
-    # --- ЛОГІКА ПЕРЕКЛАДУ ---
-    if original_title:
+    # --- ПЕРЕКЛАД ---
+    if original_title and original_title.strip():
         try:
-            # Перекладаємо на українську (src='auto' означає автовизначення мови)
-            # Виконуємо це в окремому потоці, щоб не гальмувати бота
             result = await asyncio.to_thread(translator.translate, original_title, dest='uk')
             translated_title = result.text
         except Exception as e:
             logging.error(f"Translation error: {e}")
-            # Якщо переклад не вдався - залишаємо оригінал
             translated_title = original_title
+    else:
+        translated_title = ""
 
-    caption = (
-        f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
-        f"📝 {translated_title}\n\n"
-        f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
-    )
+    # --- ФОРМУВАННЯ ТЕКСТУ ---
+    # 1. Автор
+    caption = f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
     
+    # 2. Опис (додаємо ТІЛЬКИ якщо він не пустий)
+    if translated_title and translated_title.strip():
+        caption += f"📝 {translated_title}\n\n"
+    
+    # 3. Посилання
+    caption += f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
+    
+    # Обрізка, якщо занадто довгий
     if len(caption) > 1024:
         caption = caption[:1000] + "..."
+        
     return caption
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Надішли мені посилання на TikTok, і я перекладу опис українською.")
+    await message.answer("Привіт! Надішли мені посилання на TikTok. Я скачаю відео та перекладу опис.")
 
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok_link(message: types.Message):
     user_url = message.text.strip()
-    status_msg = await message.reply("⏳ Обробляю та перекладаю...")
+    status_msg = await message.reply("⏳ Обробляю...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -88,7 +93,7 @@ async def handle_tiktok_link(message: types.Message):
 
         data = result['data']
         
-        # Генеруємо підпис (тепер це асинхронна функція через переклад)
+        # Формуємо підпис
         caption_text = await create_caption(data, user_url)
         
         # Музика
