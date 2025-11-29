@@ -73,15 +73,18 @@ def format_caption(nickname, username, profile_url, title, original_url):
 
 # --- ФОНОВІ ЗАДАЧІ ---
 async def keep_alive_ping():
-    logging.info("🚀 Ping service started!")
+    logging.info("🚀 Ping service started! First check in 10 seconds...")
+    await asyncio.sleep(10) # Розігрів 10 секунд
+    
     while True:
-        await asyncio.sleep(180) # 3 хвилини
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL) as response:
                     logging.info(f"🔔 Ping sent to myself. Status: {response.status}")
         except Exception as e:
             logging.error(f"❌ Ping failed: {e}")
+        
+        await asyncio.sleep(120) # Далі кожні 2 хвилини
 
 async def start_web_server():
     app = web.Application()
@@ -95,12 +98,6 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"🌍 Web server started on port {port}")
-
-# --- ФУНКЦІЯ СТАРТУ ---
-async def on_startup(bot: Bot):
-    # Запускаємо сервер і пінг як фонові задачі
-    asyncio.create_task(start_web_server())
-    asyncio.create_task(keep_alive_ping())
 
 # --- ОБРОБНИКИ ---
 
@@ -141,8 +138,8 @@ async def handle_instagram(message: types.Message):
 
         media_group = MediaGroupBuilder()
         tasks = []
-        is_video_post = False
-
+        
+        # Галерея або один файл
         if post.typename == 'GraphSidecar':
             nodes = list(post.get_sidecar_nodes())
             for node in nodes:
@@ -153,7 +150,6 @@ async def handle_instagram(message: types.Message):
         else:
             if post.is_video:
                 tasks.append((download_content(post.video_url), 'video'))
-                is_video_post = True
             else:
                 tasks.append((download_content(post.url), 'photo'))
 
@@ -161,6 +157,7 @@ async def handle_instagram(message: types.Message):
         
         files_added = 0
         
+        # Один файл
         if len(results) == 1 and results[0]:
             content_bytes = results[0]
             type_str = tasks[0][1]
@@ -175,6 +172,7 @@ async def handle_instagram(message: types.Message):
                 pfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.jpg")
                 await message.answer_photo(pfile, caption=caption_text, parse_mode="HTML")
 
+        # Багато файлів
         elif len(results) > 1:
             for idx, content_bytes in enumerate(results):
                 if content_bytes:
@@ -409,13 +407,15 @@ async def handle_twitter(message: types.Message):
         logging.error(f"Twitter Error: {e}")
         await status_msg.edit_text("❌ Помилка.")
 
-# --- ГОЛОВНА ФУНКЦІЯ ---
+# --- ГОЛОВНА ФУНКЦІЯ (ASYNCIO.GATHER) ---
 async def main():
-    # Реєструємо функцію, яка запуститься разом з ботом
-    dp.startup.register(on_startup) 
-    
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    # Запускаємо все разом паралельно
+    await asyncio.gather(
+        start_web_server(),
+        keep_alive_ping(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
