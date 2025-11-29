@@ -2,3 +2,4 @@ aiogram
 aiohttp
 deep-translator
 langdetect
+yt-dlp
