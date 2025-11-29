@@ -24,63 +24,26 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 translator = GoogleTranslator(source='auto', target='uk')
 
-# ==========================================================
-# 🧠 УНІВЕРСАЛЬНИЙ МОЗОК БОТА
-# ==========================================================
+# --- РОЗУМНИЙ ПАРСИНГ ---
 
 def parse_message_data(text):
     """
-    1. Знаходить посилання.
-    2. Перевіряє наявність мінуса/знаку оклику (Clean Mode).
-    Повертає: (url, clean_mode)
+    Повертає: (url, clean_mode, audio_mode)
     """
-    if not text: return None, False
-    
+    if not text:
+        return None, False, False
+        
     url_match = re.search(r'(https?://[^\s]+)', text)
-    if not url_match: return None, False
+    if not url_match:
+        return None, False, False
     
     found_url = url_match.group(1)
-    text_without_url = text.replace(found_url, "")
+    cmd_text = text.replace(found_url, "").lower()
     
-    clean_mode = False
-    if '-' in text_without_url or '!' in text_without_url:
-        clean_mode = True
+    clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text or 'video' in cmd_text)
+    audio_mode = ('!a' in cmd_text or 'audio' in cmd_text or 'music' in cmd_text)
         
-    return found_url, clean_mode
-
-async def generate_smart_caption(title, author_name, author_id, profile_url, original_url, clean_mode):
-    """
-    Єдина функція для всіх сервісів.
-    Якщо clean_mode=True -> повертає None (без підпису).
-    Якщо clean_mode=False -> перекладає текст і формує красивий підпис.
-    """
-    # 🔥 ГОЛОВНА ПЕРЕВІРКА: Якщо чистий режим - нічого не робимо
-    if clean_mode:
-        return None
-
-    # 1. Переклад тексту
-    final_title = ""
-    if title and title.strip():
-        try:
-            lang = detect(title)
-            if lang != 'en': # Англійську не чіпаємо
-                final_title = await asyncio.to_thread(translator.translate, title)
-            else:
-                final_title = title
-        except:
-            final_title = title
-    
-    # 2. Формування підпису
-    caption = f"👤 <b>{author_name}</b> (<a href='{profile_url}'>@{author_id}</a>)\n\n"
-    if final_title:
-        caption += f"📝 {final_title}\n\n"
-    caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
-    
-    # 3. Ліміт Телеграм (1024 символи)
-    if len(caption) > 1024:
-        caption = caption[:1000] + "..."
-        
-    return caption
+    return found_url, clean_mode, audio_mode
 
 async def download_content(url):
     if not url: return None
@@ -93,24 +56,40 @@ async def download_content(url):
         logging.error(f"Download Error: {e}")
     return None
 
-# ==========================================================
-# 🎮 ОБРОБНИКИ (HANDLERS)
-# ==========================================================
+async def translate_text(text):
+    if not text or not text.strip(): return ""
+    try:
+        lang = detect(text)
+        if lang != 'en':
+            return await asyncio.to_thread(translator.translate, text)
+    except: pass
+    return text
+
+def format_caption(nickname, username, profile_url, title, original_url):
+    caption = f"👤 <b>{nickname}</b> (<a href='{profile_url}'>@{username}</a>)\n\n"
+    if title:
+        caption += f"📝 {title}\n\n"
+    caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
+    if len(caption) > 1024: caption = caption[:1000] + "..."
+    return caption
+
+# --- ОБРОБНИКИ ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привіт! Я універсальний завантажувач (TikTok, Twitter/X).\n\n"
-        "✨ <b>Чистий режим:</b>\n"
-        "Додай знак <b>-</b> (мінус) будь-де в повідомленні, щоб отримати чисте відео без тексту.",
+        "Привіт! Я качаю з TikTok та Twitter (X).\n\n"
+        "⚙️ <b>Керування:</b>\n"
+        "🔗 <b>Лінк</b> — пост з підписом.\n"
+        "➖ <b>Лінк -</b> — чистий пост без тексту.\n"
+        "🎵 <b>Лінк !a</b> — додати файл музики (для фото-слайдів TikTok додається автоматично).",
         parse_mode="HTML"
     )
 
-# --- TIKTOK HANDLER ---
+# === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok(message: types.Message):
-    # 1. Парсинг (працює для всіх)
-    user_url, clean_mode = parse_message_data(message.text)
+    user_url, clean_mode, audio_mode = parse_message_data(message.text)
     if not user_url: return
 
     status_msg = await message.reply("🎵 TikTok: Обробляю...")
@@ -121,33 +100,49 @@ async def handle_tiktok(message: types.Message):
                 result = await response.json()
 
         if result.get('code') != 0:
-            await status_msg.edit_text("❌ Не знайдено.")
+            await status_msg.edit_text("❌ TikTok: Не знайдено.")
             return
 
         data = result['data']
-        author = data.get('author', {})
-        unique_id = author.get('unique_id', '')
+        
+        # Підпис
+        caption_text = None
+        if not clean_mode:
+            trans_desc = await translate_text(data.get('title', ''))
+            author = data.get('author', {})
+            unique_id = author.get('unique_id', '')
+            caption_text = format_caption(
+                author.get('nickname', 'User'), unique_id,
+                f"https://www.tiktok.com/@{unique_id}",
+                trans_desc, user_url
+            )
 
-        # 2. Генеруємо підпис через "Універсальний мозок"
-        caption_text = await generate_smart_caption(
-            title=data.get('title', ''),
-            author_name=author.get('nickname', 'User'),
-            author_id=unique_id,
-            profile_url=f"https://www.tiktok.com/@{unique_id}",
-            original_url=user_url,
-            clean_mode=clean_mode  # <-- Передаємо прапорець сюди
-        )
+        # Перевіряємо, чи це слайдер (фото)
+        is_slideshow = 'images' in data and data['images']
 
-        music_url = data.get('music')
-        music_bytes = await download_content(music_url)
-        music_file = BufferedInputFile(music_bytes, filename="audio.mp3") if music_bytes else None
+        # 🔥 АВТОМАТИЧНА МУЗИКА
+        # Качаємо, якщо:
+        # 1. Користувач попросив (!a)
+        # 2. АБО це слайдер (is_slideshow)
+        should_download_music = audio_mode or is_slideshow
 
-        if 'images' in data and data['images']:
+        music_file = None
+        if should_download_music:
+            music_url = data.get('music')
+            music_bytes = await download_content(music_url)
+            music_info = data.get('music_info', {})
+            music_name = f"{music_info.get('author','')} - {music_info.get('title','')}.mp3"
+            if music_bytes:
+                music_file = BufferedInputFile(music_bytes, filename=music_name)
+
+        # 1. Фото (Слайдер)
+        if is_slideshow:
             await status_msg.edit_text("📸 TikTok: Фото...")
             images = data['images']
+            chunk_size = 10
             first = True
-            for i in range(0, len(images), 10):
-                chunk = images[i:i + 10]
+            for i in range(0, len(images), chunk_size):
+                chunk = images[i:i + chunk_size]
                 media_group = MediaGroupBuilder()
                 for idx, img_url in enumerate(chunk):
                     if first and idx == 0 and caption_text:
@@ -157,14 +152,21 @@ async def handle_tiktok(message: types.Message):
                 await message.answer_media_group(media_group.build())
                 first = False
             
-            if music_file: await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
+            # Відправляємо музику (вона точно скачалась, бо is_slideshow=True)
+            if music_file:
+                await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
             await status_msg.delete()
+
+        # 2. Відео
         else:
             await status_msg.edit_text("🎥 TikTok: Відео...")
             vid_url = data.get('hdplay') or data.get('play')
             cover_url = data.get('origin_cover') or data.get('cover')
             
-            vid_bytes, cover_bytes = await asyncio.gather(download_content(vid_url), download_content(cover_url))
+            vid_bytes, cover_bytes = await asyncio.gather(
+                download_content(vid_url),
+                download_content(cover_url)
+            )
 
             if vid_bytes:
                 vfile = BufferedInputFile(vid_bytes, filename=f"tk_{data['id']}.mp4")
@@ -179,19 +181,20 @@ async def handle_tiktok(message: types.Message):
                     vfile, caption=caption_text, parse_mode="HTML",
                     thumbnail=tfile, width=w, height=h, supports_streaming=True
                 )
-                if music_file: await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
+                # Тут музика відправиться ТІЛЬКИ якщо було audio_mode
+                if music_file:
+                    await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
                 await status_msg.delete()
 
     except Exception as e:
         logging.error(f"TikTok Error: {e}")
-        await status_msg.edit_text("❌ Помилка.")
+        await status_msg.edit_text("❌ Помилка TikTok.")
 
 
-# --- TWITTER / X HANDLER ---
+# === TWITTER / X ===
 @dp.message(F.text.contains("twitter.com") | F.text.contains("x.com"))
 async def handle_twitter(message: types.Message):
-    # 1. Парсинг
-    user_url, clean_mode = parse_message_data(message.text)
+    user_url, clean_mode, audio_mode = parse_message_data(message.text)
     if not user_url: return
 
     status_msg = await message.reply("🐦 Twitter: Аналізую...")
@@ -201,10 +204,11 @@ async def handle_twitter(message: types.Message):
         await status_msg.edit_text("❌ Не знайдено ID.")
         return
     tweet_id = match.group(1)
-    
+    api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://api.fxtwitter.com/status/{tweet_id}") as response:
+            async with session.get(api_url) as response:
                 if response.status != 200:
                     await status_msg.edit_text("❌ Твіт не знайдено.")
                     return
@@ -215,23 +219,24 @@ async def handle_twitter(message: types.Message):
             await status_msg.edit_text("❌ Помилка API.")
             return
 
-        author = tweet.get('author', {})
-        screen_name = author.get('screen_name', 'twitter')
-
-        # 2. Генеруємо підпис через "Універсальний мозок"
-        caption_text = await generate_smart_caption(
-            title=tweet.get('text', ''),
-            author_name=author.get('name', 'User'),
-            author_id=screen_name,
-            profile_url=f"https://twitter.com/{screen_name}",
-            original_url=user_url,
-            clean_mode=clean_mode  # <-- Передаємо прапорець сюди
-        )
+        caption_text = None
+        if not clean_mode:
+            trans_text = await translate_text(tweet.get('text', ''))
+            author = tweet.get('author', {})
+            screen_name = author.get('screen_name', 'twitter')
+            caption_text = format_caption(
+                author.get('name', 'User'), screen_name,
+                f"https://twitter.com/{screen_name}",
+                trans_text, user_url
+            )
 
         media_list = tweet.get('media', {}).get('all', [])
+        
         if not media_list:
-            if caption_text: await message.answer(caption_text, parse_mode="HTML", disable_web_page_preview=True)
-            else: await message.answer("❌ Без медіа.")
+            if not clean_mode:
+                await message.answer(caption_text, parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                await message.answer("❌ Немає медіа.")
             await status_msg.delete()
             return
 
@@ -244,7 +249,6 @@ async def handle_twitter(message: types.Message):
                 vbytes = await download_content(vdata['url'])
                 if vbytes:
                     vfile = BufferedInputFile(vbytes, filename=f"tw_{tweet_id}.mp4")
-                    afile = BufferedInputFile(vbytes, filename="audio.mp3")
                     w = vdata.get('width')
                     h = vdata.get('height')
                     
@@ -252,8 +256,13 @@ async def handle_twitter(message: types.Message):
                         vfile, caption=caption_text, parse_mode="HTML",
                         width=w, height=h, supports_streaming=True
                     )
-                    await message.answer_audio(afile, caption="🎵 Звук" if not clean_mode else None)
+                    
+                    if audio_mode:
+                        afile = BufferedInputFile(vbytes, filename=f"tw_audio_{tweet_id}.mp3")
+                        await message.answer_audio(afile, caption="🎵 Звук" if not clean_mode else None)
+                    
                     await status_msg.delete()
+                    return
         else:
             await status_msg.edit_text("⬇️ Twitter: Фото...")
             if len(media_list) == 1:
@@ -271,11 +280,6 @@ async def handle_twitter(message: types.Message):
     except Exception as e:
         logging.error(f"Twitter Error: {e}")
         await status_msg.edit_text("❌ Помилка.")
-
-# --- INSTAGRAM / YOUTUBE (Місце для майбутніх сервісів) ---
-# Коли будемо додавати, просто викличемо:
-# caption = await generate_smart_caption(..., clean_mode=clean_mode)
-# І все запрацює автоматично!
 
 # --- ВЕБ-СЕРВЕР ---
 async def health_check(request):
