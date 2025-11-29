@@ -134,13 +134,12 @@ async def start_web_server():
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    cookies_status = "Авторизований ✅" if os.path.exists('cookies.txt') else "Без входу ⚠️"
     await message.answer(
-        f"Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.\n\n"
-        f"🍪 <b>YouTube статус:</b> {cookies_status}"
+        "Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.\n\n"
+        "🔴 <b>Важливо:</b> YouTube часто блокує серверні запити. Якщо не качає — спробуйте пізніше."
     )
 
-# === YOUTUBE (Robust Format Selection) ===
+# === YOUTUBE (BRUTE FORCE CLIENTS) ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
     user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
@@ -159,56 +158,83 @@ async def handle_youtube(message: types.Message):
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
 
-    # 👇 ГОЛОВНА ЗМІНА: Гнучкий формат
-    # Ми кажемо: "Дай найкраще відео, не більше вказаної якості, у будь-якому форматі".
-    # А потім "merge_output_format" зробить з цього mp4.
-    ydl_opts = {
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'format': f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
-        'merge_output_format': 'mp4', # 👈 Це магічний рядок, який все фіксить
-    }
+    # 🔥 СПИСОК КЛІЄНТІВ ДЛЯ ПЕРЕБОРУ 🔥
+    # Ми будемо пробувати їх по черзі, поки один не спрацює
+    clients_list = [
+        'tv',                # Smart TV (найменше блокувань)
+        'android_embedded',  # Вбудований плеєр (рідко блокують)
+        'web_creator',       # YouTube Studio (іноді пускає)
+        'ios',               # iPhone
+        'android'            # Звичайний Android (найчастіше блокують)
+    ]
 
-    # Підключаємо куки
-    if os.path.exists('cookies.txt'):
-        ydl_opts['cookiefile'] = 'cookies.txt'
-    else:
-        # Fallback
-        ydl_opts['extractor_args'] = {
-            'youtube': {
-                'player_skip': ['webpage', 'configs', 'js'],
-                'player_client': ['android_creator', 'android'],
-            }
+    file_path = None
+    last_error = None
+    info_dict = None
+
+    for client in clients_list:
+        logging.info(f"🔄 Trying YouTube client: {client} ...")
+        
+        ydl_opts = {
+            'outtmpl': 'downloads/%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            # Гнучкий формат: беремо будь-що до вказаної якості і конвертуємо в MP4
+            'format': f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
+            'merge_output_format': 'mp4',
+            'extractor_args': {
+                'youtube': {
+                    'player_skip': ['webpage', 'configs', 'js'],
+                    'player_client': [client],
+                }
+            },
         }
 
-    if audio_mode and not cut_range:
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
-        ydl_opts['outtmpl'] = 'downloads/%(id)s.mp3'
+        # Якщо є cookies.txt - пробуємо з ними (хоча краще без них, якщо вони биті)
+        if os.path.exists('cookies.txt'):
+            ydl_opts['cookiefile'] = 'cookies.txt'
 
-    if cut_range:
-        ydl_opts['download_ranges'] = lambda info, ydl: [{'start_time': cut_range[0], 'end_time': cut_range[1]}]
-        ydl_opts['force_keyframes_at_cuts'] = True 
+        if audio_mode and not cut_range:
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
+            ydl_opts['outtmpl'] = 'downloads/%(id)s.mp3'
 
+        if cut_range:
+            ydl_opts['download_ranges'] = lambda info, ydl: [{'start_time': cut_range[0], 'end_time': cut_range[1]}]
+            ydl_opts['force_keyframes_at_cuts'] = True 
+
+        try:
+            loop = asyncio.get_event_loop()
+            def download_task(opts):
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(user_url, download=True)
+
+            info_dict = await loop.run_in_executor(None, download_task, ydl_opts)
+            file_id = info_dict.get('id')
+            files = glob.glob(f"downloads/{file_id}*")
+            
+            if files:
+                file_path = files[0]
+                logging.info(f"✅ Success with client: {client}")
+                break # Успіх! Виходимо з циклу
+        except Exception as e:
+            logging.warning(f"❌ Client {client} failed: {e}")
+            last_error = e
+            continue # Пробуємо наступний клієнт
+
+    # Якщо нічого не вийшло після всіх спроб
+    if not file_path:
+        err_msg = str(last_error)
+        if "Sign in" in err_msg:
+             await status_msg.edit_text("❌ YouTube блокує сервер. Спробуйте видалити cookies.txt з GitHub.")
+        else:
+             await status_msg.edit_text("❌ Не вдалося скачати відео жодним методом.")
+        return
+
+    # Відправка
     try:
-        loop = asyncio.get_event_loop()
-        def download_task():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(user_url, download=True)
-
-        info_dict = await loop.run_in_executor(None, download_task)
-        file_id = info_dict.get('id')
-        files = glob.glob(f"downloads/{file_id}*")
-        
-        if not files:
-            await status_msg.edit_text("❌ YouTube: Не вдалося скачати файл.")
-            return
-
-        file_path = files[0]
-        
         caption_text = None
-        if not clean_mode:
+        if not clean_mode and info_dict:
             title = info_dict.get('title', '')
             trans_title = await translate_text(title)
             author = info_dict.get('uploader', 'YouTube')
@@ -225,22 +251,13 @@ async def handle_youtube(message: types.Message):
                  audio_file = FSInputFile(file_path, filename="cut_audio.mp3")
                  await message.answer_audio(audio_file, caption="🎵 Звук")
 
-        await status_msg.delete()
-        os.remove(file_path)
-
     except Exception as e:
-        logging.error(f"YouTube Error: {e}")
-        err_msg = str(e)
-        if "Sign in" in err_msg:
-             await status_msg.edit_text("❌ YouTube вимагає оновлення cookies.txt.")
-        elif "Requested format is not available" in err_msg:
-             await status_msg.edit_text("❌ Формат недоступний. Спробуй іншу якість.")
-        else:
-             await status_msg.edit_text("❌ Помилка завантаження.")
-        
-        for f in glob.glob(f"downloads/*"):
-            try: os.remove(f)
-            except: pass
+        logging.error(f"Sending Error: {e}")
+        await status_msg.edit_text("❌ Помилка при відправці.")
+    finally:
+        await status_msg.delete()
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 # === INSTAGRAM ===
 @dp.message(F.text.contains("instagram.com"))
