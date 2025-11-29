@@ -2,28 +2,20 @@ import logging
 import os
 import asyncio
 import re
+import glob
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import BufferedInputFile
+from aiogram.types import FSInputFile, BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
 from deep_translator import GoogleTranslator
 from langdetect import detect
+import yt_dlp
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
-
-# 👇 СПИСОК СЕРВЕРІВ (Бот буде перебирати їх по черзі)
-COBALT_INSTANCES = [
-    "https://co.wuk.sh/api/json",       # Дуже стабільний
-    "https://api.succoon.com/api/json", # Запасний
-    "https://cobalt.tools/api/json",    # Ще один
-    "https://api.cobalt.tools/api/json" # Офіційний (останній шанс)
-]
-
-# 👇 Твоє посилання з Render
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
 logging.basicConfig(level=logging.INFO)
@@ -83,7 +75,7 @@ def format_caption(nickname, username, profile_url, title, original_url):
 # --- САМО-ПІНГ ---
 async def keep_alive_ping():
     while True:
-        await asyncio.sleep(180)  # 3 хвилини
+        await asyncio.sleep(180)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL) as response:
@@ -97,108 +89,89 @@ async def keep_alive_ping():
 async def cmd_start(message: types.Message):
     await message.answer("Привіт! Я качаю з TikTok, Twitter (X) та Instagram 📸.")
 
-# === INSTAGRAM (MULTI-SERVER) ===
+# === INSTAGRAM (YT-DLP EDITION) ===
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
     user_url, clean_mode, audio_mode = parse_message_data(message.text)
     if not user_url: return
 
-    status_msg = await message.reply("📸 Instagram: Шукаю робочий сервер...")
+    status_msg = await message.reply("📸 Instagram: Завантажую...")
+    
+    # Створюємо папку для завантажень, якщо немає
+    if not os.path.exists("downloads"):
+        os.makedirs("downloads")
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    # Налаштування yt-dlp
+    ydl_opts = {
+        'outtmpl': 'downloads/%(id)s.%(ext)s', # Куди зберігати
+        'format': 'best', # Найкраща якість
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True, # Качати тільки одне відео/фото, не весь профіль
+        # Обходимо блокування (іноді допомагає)
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
-    payload = {"url": user_url}
-    
-    data = None
-    success_server = None
-
-    # 🔄 ЦИКЛ: Пробуємо сервери по черзі
-    async with aiohttp.ClientSession() as session:
-        for api_url in COBALT_INSTANCES:
-            try:
-                async with session.post(api_url, json=payload, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get('status') != 'error':
-                            success_server = api_url
-                            break # Знайшли робочий! Виходимо з циклу
-            except Exception as e:
-                logging.warning(f"Server {api_url} failed: {e}")
-                continue
-    
-    if not data or data.get('status') == 'error':
-        await status_msg.edit_text("❌ Instagram: Всі сервери зайняті або профіль закритий.")
-        return
-
-    # Якщо дійшли сюди - значить скачали
-    if success_server:
-        logging.info(f"Instagram success via: {success_server}")
-        await status_msg.edit_text("📸 Instagram: Завантажую медіа...")
 
     try:
+        # Запускаємо yt-dlp в окремому потоці, щоб не блокувати бота
+        loop = asyncio.get_event_loop()
+        
+        def download_task():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(user_url, download=True)
+                return info
+
+        info_dict = await loop.run_in_executor(None, download_task)
+        
+        # Знаходимо скачаний файл
+        file_id = info_dict.get('id')
+        files = glob.glob(f"downloads/{file_id}.*")
+        
+        if not files:
+            await status_msg.edit_text("❌ Instagram: Файл завантажено, але не знайдено.")
+            return
+
+        file_path = files[0]
+        
+        # Готуємо підпис
         caption_text = None
         if not clean_mode:
-            caption_text = f"🔗 <a href='{user_url}'>Оригінал Instagram</a>"
+            # yt-dlp іноді дає опис
+            desc = info_dict.get('description') or info_dict.get('title') or ""
+            # Обрізаємо зайве
+            desc = desc.split('\n')[0] if desc else "" 
+            trans_desc = await translate_text(desc)
+            uploader = info_dict.get('uploader', 'Instagram User')
+            caption_text = f"👤 <b>{uploader}</b>\n\n📝 {trans_desc}\n\n🔗 <a href='{user_url}'>Оригінал</a>"
 
-        # 1. Один файл
-        if data.get('status') == 'stream' or (data.get('status') == 'redirect'):
-            media_url = data.get('url')
-            media_bytes = await download_content(media_url)
+        # Відправляємо файл
+        input_file = FSInputFile(file_path)
+        
+        if file_path.endswith(".mp4") or file_path.endswith(".mkv"):
+            await message.answer_video(input_file, caption=caption_text, parse_mode="HTML")
             
-            if media_bytes:
-                is_video = ".mp4" in media_url or "video" in data.get('filename', '')
-                filename = "insta_video.mp4" if is_video else "insta_photo.jpg"
-                file = BufferedInputFile(media_bytes, filename=filename)
-
-                if is_video:
-                    await message.answer_video(file, caption=caption_text, parse_mode="HTML")
-                    if audio_mode:
-                        afile = BufferedInputFile(media_bytes, filename="insta_audio.mp3")
-                        await message.answer_audio(afile, caption="🎵 Звук з Reels")
-                else:
-                    await message.answer_photo(file, caption=caption_text, parse_mode="HTML")
+            # Якщо треба аудіо
+            if audio_mode:
+                # Відправляємо те саме відео як аудіо (Telegram сам розбереться) або конвертуємо
+                # Для швидкості просто відправимо файл як аудіо
+                audio_file = FSInputFile(file_path, filename="insta_audio.mp3")
+                await message.answer_audio(audio_file, caption="🎵 Звук з Instagram")
                 
-                await status_msg.delete()
-                return
+        elif file_path.endswith(".jpg") or file_path.endswith(".png") or file_path.endswith(".webp"):
+            await message.answer_photo(input_file, caption=caption_text, parse_mode="HTML")
+        
+        await status_msg.delete()
 
-        # 2. Галерея
-        elif data.get('status') == 'picker':
-            items = data.get('picker', [])
-            media_group = MediaGroupBuilder()
-            tasks = [download_content(item['url']) for item in items]
-            results = await asyncio.gather(*tasks)
-
-            added_count = 0
-            for idx, content_bytes in enumerate(results):
-                if content_bytes:
-                    item_type = items[idx].get('type')
-                    if item_type == 'video':
-                         m_file = BufferedInputFile(content_bytes, filename=f"inst_{idx}.mp4")
-                         if added_count == 0 and caption_text:
-                             media_group.add_video(media=m_file, caption=caption_text, parse_mode="HTML")
-                         else:
-                             media_group.add_video(media=m_file)
-                    else:
-                         m_file = BufferedInputFile(content_bytes, filename=f"inst_{idx}.jpg")
-                         if added_count == 0 and caption_text:
-                             media_group.add_photo(media=m_file, caption=caption_text, parse_mode="HTML")
-                         else:
-                             media_group.add_photo(media=m_file)
-                    added_count += 1
-            
-            if added_count > 0:
-                await message.answer_media_group(media_group.build())
-                await status_msg.delete()
-                return
-
-        await status_msg.edit_text("❌ Instagram: Формат не підтримується.")
+        # Видаляємо файл після відправки
+        os.remove(file_path)
 
     except Exception as e:
-        logging.error(f"Instagram Error: {e}")
-        await status_msg.edit_text("❌ Помилка обробки Instagram.")
+        logging.error(f"Instagram yt-dlp Error: {e}")
+        err_msg = str(e)
+        if "Login required" in err_msg:
+             await status_msg.edit_text("❌ Instagram: Цей пост доступний тільки для авторизованих користувачів (приватний або 18+).")
+        else:
+             await status_msg.edit_text("❌ Instagram: Не вдалося завантажити. Спробуйте пізніше.")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
