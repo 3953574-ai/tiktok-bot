@@ -16,6 +16,7 @@ import instaloader
 import yt_dlp
 import static_ffmpeg
 
+# Активуємо FFmpeg для нарізки
 static_ffmpeg.add_paths()
 
 # --- КОНФІГУРАЦІЯ ---
@@ -23,6 +24,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
+# Логи
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -57,7 +59,6 @@ def parse_message_data(text):
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text or 'video' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text or 'music' in cmd_text)
     
-    # Пошук команди нарізки
     cut_range = None
     cut_match = re.search(r'cut\s+(\d{1,2}:\d{2}(?::\d{2})?)-(\d{1,2}:\d{2}(?::\d{2})?)', cmd_text)
     if cut_match:
@@ -66,8 +67,7 @@ def parse_message_data(text):
         if end_sec > start_sec:
             cut_range = (start_sec, end_sec)
 
-    # Пошук якості (наприклад: 1080, 480, 360)
-    quality = 720 # Стандарт
+    quality = 720
     res_match = re.search(r'\b(144|240|360|480|720|1080|1440|2160)\b', cmd_text)
     if res_match:
         quality = int(res_match.group(1))
@@ -135,16 +135,16 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привіт! Я качаю з TikTok, Twitter (X), Instagram та YouTube.\n\n"
-        "📺 <b>Якість YouTube:</b>\n"
-        "За замовчуванням: <b>720p</b>\n"
-        "Вказати іншу: <code>посилання 1080</code> (або 480, 1440)\n\n"
-        "✂️ <b>Нарізка:</b>\n"
-        "<code>посилання cut 00:10-00:30</code>",
+        "Привіт! Я качаю з:\n"
+        "🎵 <b>TikTok</b>\n"
+        "📸 <b>Instagram</b>\n"
+        "🐦 <b>Twitter (X)</b>\n"
+        "📺 <b>YouTube</b>\n\n"
+        "✂️ <b>Нарізка:</b> посилання + <code>cut 00:10-00:15</code>",
         parse_mode="HTML"
     )
 
-# === YOUTUBE (Anti-Bot Fix + Quality) ===
+# === YOUTUBE (ANTI-BOT BYPASS) ===
 @dp.message(F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_youtube(message: types.Message):
     user_url, clean_mode, audio_mode, cut_range, quality = parse_message_data(message.text)
@@ -164,7 +164,6 @@ async def handle_youtube(message: types.Message):
         os.makedirs("downloads")
 
     # Формуємо рядок формату
-    # Наприклад: bestvideo[height<=1080]+bestaudio
     format_str = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
     ydl_opts = {
@@ -172,11 +171,11 @@ async def handle_youtube(message: types.Message):
         'quiet': True,
         'no_warnings': True,
         'format': format_str,
-        # 👇 ГОЛОВНИЙ ФІКС ПОМИЛКИ "Sign in"
-        # Прикидаємось клієнтом Android, щоб обійти перевірку
+        # 👇 ГОЛОВНИЙ ФІКС: Ігноруємо веб-версію, йдемо тільки через Android API
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios']
+                'player_skip': ['webpage', 'configs', 'js'], 
+                'player_client': ['android', 'ios'],
             }
         },
     }
@@ -201,7 +200,7 @@ async def handle_youtube(message: types.Message):
         files = glob.glob(f"downloads/{file_id}*")
         
         if not files:
-            await status_msg.edit_text("❌ YouTube: Помилка файлу (можливо, якість недоступна).")
+            await status_msg.edit_text("❌ YouTube: Не вдалося скачати файл.")
             return
 
         file_path = files[0]
@@ -231,7 +230,7 @@ async def handle_youtube(message: types.Message):
         logging.error(f"YouTube Error: {e}")
         err_msg = str(e)
         if "Sign in" in err_msg:
-             await status_msg.edit_text("❌ YouTube заблокував запит (вимагає входу). Спробуйте пізніше або інше відео.")
+             await status_msg.edit_text("❌ YouTube вимагає входу (спробуй пізніше або інше відео).")
         else:
              await status_msg.edit_text("❌ Помилка завантаження.")
         
