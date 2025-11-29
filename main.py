@@ -25,10 +25,9 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Пам'ять для кнопок (ID посилання -> саме посилання)
+# Пам'ять для кнопок
 LINK_STORAGE = {}
 
-# Дзеркала для YouTube
 COBALT_MIRRORS = [
     "https://co.wuk.sh/api/json",
     "https://api.cobalt.tools/api/json",
@@ -50,23 +49,33 @@ dp = Dispatcher()
 translator = GoogleTranslator(source='auto', target='uk')
 
 # --- КЛАВІАТУРИ ---
-def get_media_keyboard(url, is_video=True):
-    # Генеруємо унікальний ID для цього посилання
+def get_media_keyboard(url, content_type='video'):
+    # content_type: 'video' або 'photo'
     link_id = str(uuid.uuid4())[:8]
     LINK_STORAGE[link_id] = url
     
     buttons = []
-    # Кнопка "Чисте" (для всього)
-    row1 = [InlineKeyboardButton(text="🙈 Без підписів", callback_data=f"clean:{link_id}")]
+    # Кнопка "Чисте" (є завжди)
+    clean_btn = InlineKeyboardButton(text="🙈 Без підписів", callback_data=f"clean:{link_id}")
     
-    # Кнопка "Аудіо" (тільки для відео)
-    if is_video:
-        row1.insert(0, InlineKeyboardButton(text="🎵 + Аудіо", callback_data=f"audio:{link_id}"))
+    if content_type == 'video':
+        # Для відео додаємо кнопку отримання аудіо
+        audio_btn = InlineKeyboardButton(text="🎵 + Аудіо", callback_data=f"audio:{link_id}")
+        buttons.append([audio_btn, clean_btn])
+    else:
+        # Для фото тільки кнопка очистки (бо аудіо ми вже скинули автоматом)
+        buttons.append([clean_btn])
     
-    buttons.append(row1)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
+
+def sanitize_filename(name):
+    """Прибирає погані символи з назви файлу"""
+    if not name: return "audio"
+    # Залишаємо тільки букви, цифри, дужки, дефіси
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    return name[:50]  # Обрізаємо, щоб не було занадто довгим
 
 def time_to_seconds(time_str):
     parts = list(map(int, time_str.split(':')))
@@ -82,7 +91,6 @@ def parse_message_data(text):
     found_url = url_match.group(1)
     cmd_text = text.replace(found_url, "").lower()
     
-    # Текстові команди
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text)
     
@@ -171,14 +179,14 @@ async def start_web_server():
     await site.start()
 
 # ==========================================
-# 🔥 ЛОГІКА ОБРОБКИ (Universal Handler) 🔥
+# 🔥 ЛОГІКА ОБРОБКИ 🔥
 # ==========================================
 
 async def process_media_request(message: types.Message, user_url, clean_mode=False, audio_mode=False, cut_range=None, quality=720, is_button_click=False):
     if not is_button_click:
         status_msg = await message.reply("⏳ Обробляю...")
     else:
-        status_msg = None # При натисканні кнопки не спамимо новим "Обробляю"
+        status_msg = None
 
     try:
         # --- TIKTOK ---
@@ -193,13 +201,22 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 unique_id = data['author']['unique_id']
                 caption_text = format_caption(data['author']['nickname'], f"https://www.tiktok.com/@{unique_id}", trans, user_url)
 
-            # Музика (тільки якщо явно просили)
+            # Підготовка аудіо (назва файлу!)
             music_file = None
-            if audio_mode:
-                mb = await download_content(data.get('music'))
-                if mb: music_file = BufferedInputFile(mb, filename="music.mp3")
+            music_url = data.get('music')
+            # Для фото музика качається завжди, для відео - якщо просили
+            should_download_music = audio_mode or ('images' in data and data['images'])
+            
+            if should_download_music and music_url:
+                mb = await download_content(music_url)
+                if mb:
+                    # Формуємо гарну назву: "Автор - Трек.mp3"
+                    m_author = data.get('music_info', {}).get('author', 'TikTok')
+                    m_title = data.get('music_info', {}).get('title', 'Audio')
+                    fname = f"{sanitize_filename(m_author)} - {sanitize_filename(m_title)}.mp3"
+                    music_file = BufferedInputFile(mb, filename=fname)
 
-            # Фото
+            # === ФОТО (Слайдшоу) ===
             if 'images' in data and data['images']:
                 tasks = [download_content(u) for u in data['images']]
                 imgs = await asyncio.gather(*tasks)
@@ -210,26 +227,28 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                         if i==0 and caption_text: mg.add_photo(f, caption=caption_text, parse_mode="HTML")
                         else: mg.add_photo(f)
                 
-                # Відправка
                 msgs = await message.answer_media_group(mg.build())
                 
-                # Додаємо кнопку до першого повідомлення групи, якщо це не чистий режим
-                if not clean_mode and not audio_mode and msgs:
+                # Автоматично кидаємо аудіо, якщо це не чистий режим
+                if music_file and not clean_mode:
+                    await message.answer_audio(music_file)
+
+                # Додаємо кнопку "Тільки фото" (Clean)
+                if not clean_mode and msgs:
                     try:
                         await bot.edit_message_reply_markup(
                             chat_id=msgs[0].chat.id, 
                             message_id=msgs[0].message_id, 
-                            reply_markup=get_media_keyboard(user_url, is_video=False)
+                            reply_markup=get_media_keyboard(user_url, content_type='photo')
                         )
                     except: pass
 
-            # Відео
+            # === ВІДЕО ===
             else:
                 vid_url = data.get('hdplay') or data.get('play')
                 vb = await download_content(vid_url)
                 if vb:
-                    # Кнопки додаємо тільки якщо це стандартний режим
-                    kb = get_media_keyboard(user_url, is_video=True) if (not clean_mode and not audio_mode) else None
+                    kb = get_media_keyboard(user_url, content_type='video') if (not clean_mode and not audio_mode) else None
                     await message.answer_video(
                         BufferedInputFile(vb, filename="tk.mp4"), 
                         caption=caption_text, 
@@ -237,7 +256,9 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                         reply_markup=kb
                     )
             
-            if music_file: await message.answer_audio(music_file, caption="🎵 Звук")
+            # Якщо просили тільки аудіо (через команду !a)
+            if audio_mode and not ('images' in data) and music_file: 
+                await message.answer_audio(music_file, caption="🎵 Звук")
 
         # --- INSTAGRAM ---
         elif "instagram.com" in user_url:
@@ -268,26 +289,28 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
             results = await asyncio.gather(*[t[0] for t in tasks])
             
+            # 1 файл
             if len(results) == 1 and results[0]:
                 content, is_vid = results[0], tasks[0][1]
                 f = BufferedInputFile(content, filename=f"insta.{'mp4' if is_vid else 'jpg'}")
                 
                 if is_vid:
-                    # Якщо просили тільки аудіо (через кнопку)
                     if audio_mode and not clean_mode:
                          await message.answer_audio(BufferedInputFile(content, filename="audio.mp3"), caption="🎵 Звук з Instagram")
                     else:
-                        kb = get_media_keyboard(user_url, is_video=True) if (not clean_mode and not audio_mode) else None
+                        kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
                         await message.answer_video(f, caption=caption_text, parse_mode="HTML", reply_markup=kb)
                 else:
-                    kb = get_media_keyboard(user_url, is_video=False) if not clean_mode else None
+                    kb = get_media_keyboard(user_url, 'photo') if not clean_mode else None
                     await message.answer_photo(f, caption=caption_text, parse_mode="HTML", reply_markup=kb)
             
+            # Галерея
             elif len(results) > 1:
-                # Галерея
+                has_video_in_gallery = False
                 for i, content in enumerate(results):
                     if content:
                         is_vid = tasks[i][1]
+                        if is_vid: has_video_in_gallery = True
                         f = BufferedInputFile(content, filename=f"m{i}.{'mp4' if is_vid else 'jpg'}")
                         if i == 0 and caption_text:
                             if is_vid: media_group.add_video(f, caption=caption_text, parse_mode="HTML")
@@ -297,13 +320,14 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                             else: media_group.add_photo(f)
                 
                 msgs = await message.answer_media_group(media_group.build())
-                # Додаємо кнопки до галереї (до першого повідомлення)
                 if not clean_mode and not audio_mode and msgs:
                      try:
+                        # Якщо в галереї є відео, даємо кнопки з аудіо, якщо ні - тільки clean
+                        ctype = 'video' if has_video_in_gallery else 'photo'
                         await bot.edit_message_reply_markup(
                             chat_id=msgs[0].chat.id, 
                             message_id=msgs[0].message_id, 
-                            reply_markup=get_media_keyboard(user_url, is_video=False)
+                            reply_markup=get_media_keyboard(user_url, ctype)
                         )
                      except: pass
 
@@ -330,7 +354,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                     if audio_mode and not clean_mode:
                          await message.answer_audio(BufferedInputFile(vb, filename="tw.mp3"), caption="🎵 Звук")
                     else:
-                        kb = get_media_keyboard(user_url, is_video=True) if (not clean_mode and not audio_mode) else None
+                        kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
                         await message.answer_video(BufferedInputFile(vb, filename="tw.mp4"), caption=caption_text, parse_mode="HTML", reply_markup=kb)
             else:
                 tasks = [download_content(m['url']) for m in media]
@@ -344,7 +368,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 msgs = await message.answer_media_group(mg.build())
                 if not clean_mode and msgs:
                      try:
-                        await bot.edit_message_reply_markup(chat_id=msgs[0].chat.id, message_id=msgs[0].message_id, reply_markup=get_media_keyboard(user_url, is_video=False))
+                        await bot.edit_message_reply_markup(chat_id=msgs[0].chat.id, message_id=msgs[0].message_id, reply_markup=get_media_keyboard(user_url, 'photo'))
                      except: pass
 
         # --- YOUTUBE ---
@@ -364,20 +388,20 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 final_path = f"downloads/final_{uuid.uuid4()}.mp4"
                 await asyncio.to_thread(process_media_locally, raw_path, final_path, False, cut_range)
 
-            # Якщо просили АУДІО (через кнопку або команду)
+            # Аудіо
             if audio_mode:
                 audio_path = f"downloads/aud_{uuid.uuid4()}.mp3"
                 await asyncio.to_thread(process_media_locally, final_path, audio_path, True, None)
                 await message.answer_audio(FSInputFile(audio_path), caption="🎵 Звук з YouTube")
                 if os.path.exists(audio_path): os.remove(audio_path)
             
-            # Якщо просили ВІДЕО (стандарт або чисте)
+            # Відео
             else:
                 caption_text = None
                 if not clean_mode:
                     caption_text = f"📺 <b>YouTube Video</b>\n\n🔗 <a href='{user_url}'>Оригінал</a>"
                 
-                kb = get_media_keyboard(user_url, is_video=True) if (not clean_mode and not audio_mode and not cut_range) else None
+                kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode and not cut_range) else None
                 await message.answer_video(FSInputFile(final_path), caption=caption_text, parse_mode="HTML", reply_markup=kb)
 
             if os.path.exists(raw_path): os.remove(raw_path)
@@ -390,37 +414,31 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
         if status_msg: await status_msg.edit_text("❌ Сталася помилка.")
 
 # ==========================
-# 🎮 ОБРОБНИКИ (HANDLERS)
+# 🎮 ОБРОБНИКИ
 # ==========================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer("Привіт! Надішли посилання на TikTok, Instagram, Twitter або YouTube.")
 
-# 1. ОБРОБКА КНОПОК
 @dp.callback_query()
 async def on_button_click(callback: CallbackQuery):
     action, link_id = callback.data.split(":")
     user_url = LINK_STORAGE.get(link_id)
-    
     if not user_url:
         await callback.answer("Посилання застаріло.", show_alert=True)
         return
-
-    await callback.answer("Виконую...") # Показуємо "годинничок"
-    
+    await callback.answer("Виконую...")
     if action == "clean":
         await process_media_request(callback.message, user_url, clean_mode=True, is_button_click=True)
     elif action == "audio":
         await process_media_request(callback.message, user_url, audio_mode=True, clean_mode=False, is_button_click=True)
 
-# 2. ОБРОБКА ПОСИЛАНЬ
 @dp.message(F.text.regexp(r'(https?://[^\s]+)') | F.caption.regexp(r'(https?://[^\s]+)'))
+@dp.edited_message(F.text.regexp(r'(https?://[^\s]+)') | F.caption.regexp(r'(https?://[^\s]+)'))
 async def handle_link(message: types.Message):
     content = message.text or message.caption
     user_url, clean, audio, cut, qual = parse_message_data(content)
-    
-    # Викликаємо універсальну функцію
     await process_media_request(message, user_url, clean, audio, cut, qual)
 
 async def main():
