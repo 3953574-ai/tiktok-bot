@@ -27,15 +27,9 @@ translator = GoogleTranslator(source='auto', target='uk')
 # --- РОЗУМНИЙ ПАРСИНГ ---
 
 def parse_message_data(text):
-    """
-    Повертає: (url, clean_mode, audio_mode)
-    """
-    if not text:
-        return None, False, False
-        
+    if not text: return None, False, False
     url_match = re.search(r'(https?://[^\s]+)', text)
-    if not url_match:
-        return None, False, False
+    if not url_match: return None, False, False
     
     found_url = url_match.group(1)
     cmd_text = text.replace(found_url, "").lower()
@@ -77,14 +71,7 @@ def format_caption(nickname, username, profile_url, title, original_url):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привіт! Я качаю з TikTok та Twitter (X).\n\n"
-        "⚙️ <b>Керування:</b>\n"
-        "🔗 <b>Лінк</b> — пост з підписом.\n"
-        "➖ <b>Лінк -</b> — чистий пост без тексту.\n"
-        "🎵 <b>Лінк !a</b> — додати файл музики (для фото-слайдів TikTok додається автоматично).",
-        parse_mode="HTML"
-    )
+    await message.answer("Привіт! Я качаю з TikTok та Twitter (X).")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
@@ -117,14 +104,8 @@ async def handle_tiktok(message: types.Message):
                 trans_desc, user_url
             )
 
-        # Перевіряємо, чи це слайдер (фото)
-        is_slideshow = 'images' in data and data['images']
-
-        # 🔥 АВТОМАТИЧНА МУЗИКА
-        # Качаємо, якщо:
-        # 1. Користувач попросив (!a)
-        # 2. АБО це слайдер (is_slideshow)
-        should_download_music = audio_mode or is_slideshow
+        has_images = 'images' in data and data['images']
+        should_download_music = audio_mode or has_images
 
         music_file = None
         if should_download_music:
@@ -135,29 +116,43 @@ async def handle_tiktok(message: types.Message):
             if music_bytes:
                 music_file = BufferedInputFile(music_bytes, filename=music_name)
 
-        # 1. Фото (Слайдер)
-        if is_slideshow:
-            await status_msg.edit_text("📸 TikTok: Фото...")
-            images = data['images']
+        # === 1. ФОТО (ВИПРАВЛЕНО) ===
+        if has_images:
+            await status_msg.edit_text("📸 TikTok: Качаю фото...")
+            images_urls = data['images']
             chunk_size = 10
             first = True
-            for i in range(0, len(images), chunk_size):
-                chunk = images[i:i + chunk_size]
-                media_group = MediaGroupBuilder()
-                for idx, img_url in enumerate(chunk):
-                    if first and idx == 0 and caption_text:
-                        media_group.add_photo(media=img_url, caption=caption_text, parse_mode="HTML")
-                    else:
-                        media_group.add_photo(media=img_url)
-                await message.answer_media_group(media_group.build())
-                first = False
             
-            # Відправляємо музику (вона точно скачалась, бо is_slideshow=True)
+            for i in range(0, len(images_urls), chunk_size):
+                chunk_urls = images_urls[i:i + chunk_size]
+                
+                # 🔥 Скачуємо файли в пам'ять, а не кидаємо посилання
+                tasks = [download_content(url) for url in chunk_urls]
+                downloaded_images = await asyncio.gather(*tasks)
+                
+                media_group = MediaGroupBuilder()
+                images_added = 0
+                
+                for idx, img_bytes in enumerate(downloaded_images):
+                    if img_bytes:
+                        # Створюємо файл в пам'яті
+                        img_file = BufferedInputFile(img_bytes, filename=f"img_{i}_{idx}.jpg")
+                        
+                        if first and images_added == 0 and caption_text:
+                            media_group.add_photo(media=img_file, caption=caption_text, parse_mode="HTML")
+                        else:
+                            media_group.add_photo(media=img_file)
+                        images_added += 1
+                
+                if images_added > 0:
+                    await message.answer_media_group(media_group.build())
+                    first = False
+            
             if music_file:
                 await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
             await status_msg.delete()
 
-        # 2. Відео
+        # === 2. ВІДЕО ===
         else:
             await status_msg.edit_text("🎥 TikTok: Відео...")
             vid_url = data.get('hdplay') or data.get('play')
@@ -181,14 +176,13 @@ async def handle_tiktok(message: types.Message):
                     vfile, caption=caption_text, parse_mode="HTML",
                     thumbnail=tfile, width=w, height=h, supports_streaming=True
                 )
-                # Тут музика відправиться ТІЛЬКИ якщо було audio_mode
                 if music_file:
                     await message.answer_audio(music_file, caption="🎵 Звук" if not clean_mode else None)
                 await status_msg.delete()
 
     except Exception as e:
         logging.error(f"TikTok Error: {e}")
-        await status_msg.edit_text("❌ Помилка TikTok.")
+        await status_msg.edit_text("❌ Помилка TikTok (не вдалося скачати медіа).")
 
 
 # === TWITTER / X ===
@@ -231,7 +225,6 @@ async def handle_twitter(message: types.Message):
             )
 
         media_list = tweet.get('media', {}).get('all', [])
-        
         if not media_list:
             if not clean_mode:
                 await message.answer(caption_text, parse_mode="HTML", disable_web_page_preview=True)
@@ -256,25 +249,37 @@ async def handle_twitter(message: types.Message):
                         vfile, caption=caption_text, parse_mode="HTML",
                         width=w, height=h, supports_streaming=True
                     )
-                    
                     if audio_mode:
                         afile = BufferedInputFile(vbytes, filename=f"tw_audio_{tweet_id}.mp3")
-                        await message.answer_audio(afile, caption="🎵 Звук" if not clean_mode else None)
-                    
+                        await message.answer_audio(afile, caption="🎵 Звук з твіта")
                     await status_msg.delete()
                     return
         else:
             await status_msg.edit_text("⬇️ Twitter: Фото...")
+            # Тут теж краще скачати, про всяк випадок, хоча twitter-лінки живуть довше
             if len(media_list) == 1:
-                await message.answer_photo(media_list[0]['url'], caption=caption_text, parse_mode="HTML")
+                p_bytes = await download_content(media_list[0]['url'])
+                if p_bytes:
+                    p_file = BufferedInputFile(p_bytes, filename="photo.jpg")
+                    await message.answer_photo(p_file, caption=caption_text, parse_mode="HTML")
             else:
+                # Галерея
+                tasks = [download_content(m['url']) for m in media_list]
+                results = await asyncio.gather(*tasks)
+                
                 media_group = MediaGroupBuilder()
-                for i, m in enumerate(media_list):
-                    if i == 0 and caption_text:
-                        media_group.add_photo(media=m['url'], caption=caption_text, parse_mode="HTML")
-                    else:
-                        media_group.add_photo(media=m['url'])
-                await message.answer_media_group(media_group.build())
+                added = 0
+                for idx, p_bytes in enumerate(results):
+                    if p_bytes:
+                        p_file = BufferedInputFile(p_bytes, filename=f"p_{idx}.jpg")
+                        if added == 0 and caption_text:
+                            media_group.add_photo(media=p_file, caption=caption_text, parse_mode="HTML")
+                        else:
+                            media_group.add_photo(media=p_file)
+                        added += 1
+                if added > 0:
+                    await message.answer_media_group(media_group.build())
+            
             await status_msg.delete()
 
     except Exception as e:
