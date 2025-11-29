@@ -10,7 +10,7 @@ import aiohttp
 from aiohttp import web
 from deep_translator import GoogleTranslator
 from langdetect import detect
-import instaloader # 📸 Нова бібліотека для Instagram
+import instaloader
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -71,16 +71,36 @@ def format_caption(nickname, username, profile_url, title, original_url):
     if len(caption) > 1024: caption = caption[:1000] + "..."
     return caption
 
-# --- САМО-ПІНГ ---
+# --- ФОНОВІ ЗАДАЧІ ---
 async def keep_alive_ping():
+    logging.info("🚀 Ping service started!")
     while True:
-        await asyncio.sleep(180)
+        await asyncio.sleep(180) # 3 хвилини
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL) as response:
                     logging.info(f"🔔 Ping sent to myself. Status: {response.status}")
         except Exception as e:
             logging.error(f"❌ Ping failed: {e}")
+
+async def start_web_server():
+    app = web.Application()
+    async def health_check(request):
+        return web.Response(text="Bot is alive!")
+    
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"🌍 Web server started on port {port}")
+
+# --- ФУНКЦІЯ СТАРТУ ---
+async def on_startup(bot: Bot):
+    # Запускаємо сервер і пінг як фонові задачі
+    asyncio.create_task(start_web_server())
+    asyncio.create_task(keep_alive_ping())
 
 # --- ОБРОБНИКИ ---
 
@@ -96,7 +116,6 @@ async def handle_instagram(message: types.Message):
 
     status_msg = await message.reply("📸 Instagram: Аналізую...")
 
-    # Витягуємо shortcode (код поста) з посилання
     shortcode_match = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url)
     if not shortcode_match:
         await status_msg.edit_text("❌ Instagram: Не зрозумів посилання.")
@@ -105,20 +124,16 @@ async def handle_instagram(message: types.Message):
     shortcode = shortcode_match.group(1)
 
     try:
-        # Запускаємо Instaloader в окремому потоці (він синхронний)
         def get_insta_data(code):
             L = instaloader.Instaloader(quiet=True)
-            # Прикидаємось iPhone, щоб не банили
             L.context._user_agent = "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 446464522)"
             return instaloader.Post.from_shortcode(L.context, code)
 
         post = await asyncio.to_thread(get_insta_data, shortcode)
 
-        # Підпис
         caption_text = None
         if not clean_mode:
             raw_caption = post.caption or ""
-            # Беремо тільки перший рядок або перші 200 символів, щоб не спамити хештегами
             raw_caption = raw_caption.split('\n')[0] if raw_caption else ""
             trans_desc = await translate_text(raw_caption)
             author = post.owner_username
@@ -128,9 +143,7 @@ async def handle_instagram(message: types.Message):
         tasks = []
         is_video_post = False
 
-        # Логіка для Галереї (Sidecar) або одного файлу
         if post.typename == 'GraphSidecar':
-            # Це карусель (багато фото/відео)
             nodes = list(post.get_sidecar_nodes())
             for node in nodes:
                 if node.is_video:
@@ -138,23 +151,19 @@ async def handle_instagram(message: types.Message):
                 else:
                     tasks.append((download_content(node.display_url), 'photo'))
         else:
-            # Це один файл
             if post.is_video:
                 tasks.append((download_content(post.video_url), 'video'))
                 is_video_post = True
             else:
                 tasks.append((download_content(post.url), 'photo'))
 
-        # Скачуємо все
         results = await asyncio.gather(*[t[0] for t in tasks])
         
-        # Формуємо відповідь
         files_added = 0
         
-        # Якщо файл один
         if len(results) == 1 and results[0]:
             content_bytes = results[0]
-            type_str = tasks[0][1] # 'video' or 'photo'
+            type_str = tasks[0][1]
             
             if type_str == 'video':
                 vfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.mp4")
@@ -166,7 +175,6 @@ async def handle_instagram(message: types.Message):
                 pfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.jpg")
                 await message.answer_photo(pfile, caption=caption_text, parse_mode="HTML")
 
-        # Якщо це галерея (більше 1 файлу)
         elif len(results) > 1:
             for idx, content_bytes in enumerate(results):
                 if content_bytes:
@@ -196,7 +204,7 @@ async def handle_instagram(message: types.Message):
         if "login" in err_str or "redirected" in err_str:
              await status_msg.edit_text("❌ Instagram: Цей пост закритий або потребує входу (18+).")
         else:
-             await status_msg.edit_text("❌ Instagram: Не вдалося завантажити (можливо, збій API).")
+             await status_msg.edit_text("❌ Instagram: Не вдалося завантажити.")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
@@ -401,27 +409,13 @@ async def handle_twitter(message: types.Message):
         logging.error(f"Twitter Error: {e}")
         await status_msg.edit_text("❌ Помилка.")
 
-# --- ВЕБ-СЕРВЕР ---
-async def health_check(request):
-    return web.Response(text="Bot is alive!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"Web server started on port {port}")
-
+# --- ГОЛОВНА ФУНКЦІЯ ---
 async def main():
+    # Реєструємо функцію, яка запуститься разом з ботом
+    dp.startup.register(on_startup) 
+    
     await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.gather(
-        start_web_server(),
-        keep_alive_ping(),
-        dp.start_polling(bot)
-    )
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
