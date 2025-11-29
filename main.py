@@ -22,7 +22,6 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Налаштовуємо перекладач
 translator = GoogleTranslator(source='auto', target='uk')
 
 # --- ФУНКЦІЇ БОТА ---
@@ -40,7 +39,7 @@ async def download_content(url):
     return None
 
 async def create_caption(data, original_url):
-    """Створює підпис. Англійську не перекладає, інше - українською."""
+    """Створює підпис з перекладом"""
     author = data.get('author', {})
     nickname = author.get('nickname', 'Unknown')
     unique_id = author.get('unique_id', '') 
@@ -48,34 +47,25 @@ async def create_caption(data, original_url):
     original_title = data.get('title', '')
     final_title = original_title
 
-    # --- ЛОГІКА МОВИ ---
+    # Логіка перекладу
     if original_title and original_title.strip():
         try:
-            # 1. Визначаємо мову
             lang = detect(original_title)
-            
-            # 2. Якщо це НЕ англійська -> перекладаємо
             if lang != 'en':
                 final_title = await asyncio.to_thread(translator.translate, original_title)
-            # Якщо англійська ('en') -> залишаємо original_title
-                
         except Exception as e:
-            logging.error(f"Language detection/translation error: {e}")
-            final_title = original_title # Якщо помилка - лишаємо оригінал
+            logging.error(f"Translation error: {e}")
+            final_title = original_title
     else:
         final_title = ""
 
-    # --- ФОРМУВАННЯ ТЕКСТУ ---
     caption = f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
-    
     if final_title and final_title.strip():
         caption += f"📝 {final_title}\n\n"
-    
     caption += f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
     
     if len(caption) > 1024:
         caption = caption[:1000] + "..."
-        
     return caption
 
 @dp.message(CommandStart())
@@ -97,8 +87,6 @@ async def handle_tiktok_link(message: types.Message):
             return
 
         data = result['data']
-        
-        # Підпис
         caption_text = await create_caption(data, user_url)
         
         # Музика
@@ -152,19 +140,32 @@ async def handle_tiktok_link(message: types.Message):
                 if cover_bytes:
                     thumbnail_file = BufferedInputFile(cover_bytes, filename="cover.jpg")
 
-                # 🔥 ВИПРАВЛЕННЯ ДЛЯ ДОВГИХ ВІДЕО
-                # Пробуємо дістати ширину/висоту з кореня об'єкта JSON.
-                # Якщо там будуть числа - Телеграм використає їх і зробить відео прямокутним.
-                vid_width = data.get('width')
-                vid_height = data.get('height')
+                # 🔥 HARD FIX ДЛЯ КВАДРАТНИХ ВІДЕО 🔥
+                # 1. Пробуємо взяти реальні розміри
+                width = data.get('width')
+                height = data.get('height')
+                
+                # Перетворюємо в int безпечно
+                try:
+                    width = int(width)
+                    height = int(height)
+                except (ValueError, TypeError):
+                    width = None
+                    height = None
 
+                # 2. Якщо розмірів немає АБО це велике відео і телеграм тупить
+                # Примусово ставимо вертикальний формат (стандарт TikTok)
+                if not width or not height:
+                    width = 720
+                    height = 1280
+                
                 await message.answer_video(
                     video_file,
                     caption=caption_text,
                     parse_mode="HTML",
                     thumbnail=thumbnail_file,
-                    width=vid_width,   # Передаємо ширину
-                    height=vid_height, # Передаємо висоту
+                    width=width,    # Явно передаємо ширину
+                    height=height,  # Явно передаємо висоту
                     supports_streaming=True
                 )
                 
