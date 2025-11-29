@@ -2,16 +2,15 @@ import logging
 import os
 import asyncio
 import re
-import glob
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, BufferedInputFile
+from aiogram.types import BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
 from deep_translator import GoogleTranslator
 from langdetect import detect
-import yt_dlp
+import instaloader # 📸 Нова бібліотека для Instagram
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -89,89 +88,115 @@ async def keep_alive_ping():
 async def cmd_start(message: types.Message):
     await message.answer("Привіт! Я качаю з TikTok, Twitter (X) та Instagram 📸.")
 
-# === INSTAGRAM (YT-DLP EDITION) ===
+# === INSTAGRAM (INSTALOADER) ===
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram(message: types.Message):
     user_url, clean_mode, audio_mode = parse_message_data(message.text)
     if not user_url: return
 
-    status_msg = await message.reply("📸 Instagram: Завантажую...")
-    
-    # Створюємо папку для завантажень, якщо немає
-    if not os.path.exists("downloads"):
-        os.makedirs("downloads")
+    status_msg = await message.reply("📸 Instagram: Аналізую...")
 
-    # Налаштування yt-dlp
-    ydl_opts = {
-        'outtmpl': 'downloads/%(id)s.%(ext)s', # Куди зберігати
-        'format': 'best', # Найкраща якість
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True, # Качати тільки одне відео/фото, не весь профіль
-        # Обходимо блокування (іноді допомагає)
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    }
+    # Витягуємо shortcode (код поста) з посилання
+    shortcode_match = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url)
+    if not shortcode_match:
+        await status_msg.edit_text("❌ Instagram: Не зрозумів посилання.")
+        return
+    
+    shortcode = shortcode_match.group(1)
 
     try:
-        # Запускаємо yt-dlp в окремому потоці, щоб не блокувати бота
-        loop = asyncio.get_event_loop()
-        
-        def download_task():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(user_url, download=True)
-                return info
+        # Запускаємо Instaloader в окремому потоці (він синхронний)
+        def get_insta_data(code):
+            L = instaloader.Instaloader(quiet=True)
+            # Прикидаємось iPhone, щоб не банили
+            L.context._user_agent = "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 446464522)"
+            return instaloader.Post.from_shortcode(L.context, code)
 
-        info_dict = await loop.run_in_executor(None, download_task)
-        
-        # Знаходимо скачаний файл
-        file_id = info_dict.get('id')
-        files = glob.glob(f"downloads/{file_id}.*")
-        
-        if not files:
-            await status_msg.edit_text("❌ Instagram: Файл завантажено, але не знайдено.")
-            return
+        post = await asyncio.to_thread(get_insta_data, shortcode)
 
-        file_path = files[0]
-        
-        # Готуємо підпис
+        # Підпис
         caption_text = None
         if not clean_mode:
-            # yt-dlp іноді дає опис
-            desc = info_dict.get('description') or info_dict.get('title') or ""
-            # Обрізаємо зайве
-            desc = desc.split('\n')[0] if desc else "" 
-            trans_desc = await translate_text(desc)
-            uploader = info_dict.get('uploader', 'Instagram User')
-            caption_text = f"👤 <b>{uploader}</b>\n\n📝 {trans_desc}\n\n🔗 <a href='{user_url}'>Оригінал</a>"
+            raw_caption = post.caption or ""
+            # Беремо тільки перший рядок або перші 200 символів, щоб не спамити хештегами
+            raw_caption = raw_caption.split('\n')[0] if raw_caption else ""
+            trans_desc = await translate_text(raw_caption)
+            author = post.owner_username
+            caption_text = f"👤 <b>{author}</b>\n\n📝 {trans_desc}\n\n🔗 <a href='{user_url}'>Оригінал</a>"
 
-        # Відправляємо файл
-        input_file = FSInputFile(file_path)
+        media_group = MediaGroupBuilder()
+        tasks = []
+        is_video_post = False
+
+        # Логіка для Галереї (Sidecar) або одного файлу
+        if post.typename == 'GraphSidecar':
+            # Це карусель (багато фото/відео)
+            nodes = list(post.get_sidecar_nodes())
+            for node in nodes:
+                if node.is_video:
+                    tasks.append((download_content(node.video_url), 'video'))
+                else:
+                    tasks.append((download_content(node.display_url), 'photo'))
+        else:
+            # Це один файл
+            if post.is_video:
+                tasks.append((download_content(post.video_url), 'video'))
+                is_video_post = True
+            else:
+                tasks.append((download_content(post.url), 'photo'))
+
+        # Скачуємо все
+        results = await asyncio.gather(*[t[0] for t in tasks])
         
-        if file_path.endswith(".mp4") or file_path.endswith(".mkv"):
-            await message.answer_video(input_file, caption=caption_text, parse_mode="HTML")
+        # Формуємо відповідь
+        files_added = 0
+        
+        # Якщо файл один
+        if len(results) == 1 and results[0]:
+            content_bytes = results[0]
+            type_str = tasks[0][1] # 'video' or 'photo'
             
-            # Якщо треба аудіо
-            if audio_mode:
-                # Відправляємо те саме відео як аудіо (Telegram сам розбереться) або конвертуємо
-                # Для швидкості просто відправимо файл як аудіо
-                audio_file = FSInputFile(file_path, filename="insta_audio.mp3")
-                await message.answer_audio(audio_file, caption="🎵 Звук з Instagram")
-                
-        elif file_path.endswith(".jpg") or file_path.endswith(".png") or file_path.endswith(".webp"):
-            await message.answer_photo(input_file, caption=caption_text, parse_mode="HTML")
-        
+            if type_str == 'video':
+                vfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.mp4")
+                await message.answer_video(vfile, caption=caption_text, parse_mode="HTML")
+                if audio_mode:
+                    afile = BufferedInputFile(content_bytes, filename=f"insta_aud_{shortcode}.mp3")
+                    await message.answer_audio(afile, caption="🎵 Звук")
+            else:
+                pfile = BufferedInputFile(content_bytes, filename=f"insta_{shortcode}.jpg")
+                await message.answer_photo(pfile, caption=caption_text, parse_mode="HTML")
+
+        # Якщо це галерея (більше 1 файлу)
+        elif len(results) > 1:
+            for idx, content_bytes in enumerate(results):
+                if content_bytes:
+                    type_str = tasks[idx][1]
+                    if type_str == 'video':
+                        m_file = BufferedInputFile(content_bytes, filename=f"inst_{idx}.mp4")
+                        if files_added == 0 and caption_text:
+                            media_group.add_video(media=m_file, caption=caption_text, parse_mode="HTML")
+                        else:
+                            media_group.add_video(media=m_file)
+                    else:
+                        m_file = BufferedInputFile(content_bytes, filename=f"inst_{idx}.jpg")
+                        if files_added == 0 and caption_text:
+                            media_group.add_photo(media=m_file, caption=caption_text, parse_mode="HTML")
+                        else:
+                            media_group.add_photo(media=m_file)
+                    files_added += 1
+            
+            if files_added > 0:
+                await message.answer_media_group(media_group.build())
+
         await status_msg.delete()
 
-        # Видаляємо файл після відправки
-        os.remove(file_path)
-
     except Exception as e:
-        logging.error(f"Instagram yt-dlp Error: {e}")
-        err_msg = str(e)
-        if "Login required" in err_msg:
-             await status_msg.edit_text("❌ Instagram: Цей пост доступний тільки для авторизованих користувачів (приватний або 18+).")
+        logging.error(f"Instagram Instaloader Error: {e}")
+        err_str = str(e).lower()
+        if "login" in err_str or "redirected" in err_str:
+             await status_msg.edit_text("❌ Instagram: Цей пост закритий або потребує входу (18+).")
         else:
-             await status_msg.edit_text("❌ Instagram: Не вдалося завантажити. Спробуйте пізніше.")
+             await status_msg.edit_text("❌ Instagram: Не вдалося завантажити (можливо, збій API).")
 
 # === TIKTOK ===
 @dp.message(F.text.contains("tiktok.com"))
