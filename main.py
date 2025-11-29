@@ -7,6 +7,7 @@ from aiogram.types import BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
+from googletrans import Translator  # Підключаємо перекладач
 
 # --- КОНФІГУРАЦІЯ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -19,6 +20,7 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+translator = Translator() # Створюємо об'єкт перекладача
 
 # --- ФУНКЦІЇ БОТА ---
 async def download_content(url):
@@ -34,16 +36,31 @@ async def download_content(url):
         logging.error(f"Error downloading {url}: {e}")
     return None
 
-def create_caption(data, original_url):
-    """Створює гарний підпис"""
+async def create_caption(data, original_url):
+    """Створює гарний підпис з перекладом"""
     author = data.get('author', {})
     nickname = author.get('nickname', 'Unknown')
     unique_id = author.get('unique_id', '') 
-    title = data.get('title', '')
     
+    # Отримуємо оригінальний текст
+    original_title = data.get('title', '')
+    translated_title = original_title
+
+    # --- ЛОГІКА ПЕРЕКЛАДУ ---
+    if original_title:
+        try:
+            # Перекладаємо на українську (src='auto' означає автовизначення мови)
+            # Виконуємо це в окремому потоці, щоб не гальмувати бота
+            result = await asyncio.to_thread(translator.translate, original_title, dest='uk')
+            translated_title = result.text
+        except Exception as e:
+            logging.error(f"Translation error: {e}")
+            # Якщо переклад не вдався - залишаємо оригінал
+            translated_title = original_title
+
     caption = (
         f"👤 <b>{nickname}</b> (@{unique_id})\n\n"
-        f"📝 {title}\n\n"
+        f"📝 {translated_title}\n\n"
         f"🔗 <a href='{original_url}'>Оригінал в TikTok</a>"
     )
     
@@ -53,12 +70,12 @@ def create_caption(data, original_url):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Надішли мені посилання на TikTok.")
+    await message.answer("Привіт! Надішли мені посилання на TikTok, і я перекладу опис українською.")
 
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok_link(message: types.Message):
     user_url = message.text.strip()
-    status_msg = await message.reply("⏳ Обробляю...")
+    status_msg = await message.reply("⏳ Обробляю та перекладаю...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -70,7 +87,9 @@ async def handle_tiktok_link(message: types.Message):
             return
 
         data = result['data']
-        caption_text = create_caption(data, user_url)
+        
+        # Генеруємо підпис (тепер це асинхронна функція через переклад)
+        caption_text = await create_caption(data, user_url)
         
         # Музика
         music_url = data.get('music')
@@ -108,10 +127,7 @@ async def handle_tiktok_link(message: types.Message):
         else:
             await status_msg.edit_text("🎥 Завантажую відео...")
             
-            # Беремо HD версію
             video_url = data.get('hdplay') or data.get('play')
-            
-            # Беремо оригінальну обкладинку (щоб відео було вертикальним)
             cover_url = data.get('origin_cover') or data.get('cover')
 
             video_bytes, cover_bytes = await asyncio.gather(
@@ -125,9 +141,6 @@ async def handle_tiktok_link(message: types.Message):
                 thumbnail_file = None
                 if cover_bytes:
                     thumbnail_file = BufferedInputFile(cover_bytes, filename="cover.jpg")
-
-                # Ми прибрали width/height, бо вони викликали помилку.
-                # Але origin_cover сам має підказати телеграму правильну форму.
                 
                 await message.answer_video(
                     video_file,
