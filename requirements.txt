@@ -4,3 +4,4 @@ deep-translator
 langdetect
 instaloader
 yt-dlp
+static-ffmpeg
