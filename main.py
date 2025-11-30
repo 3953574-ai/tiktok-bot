@@ -27,12 +27,13 @@ RENDER_URL = "https://tiktok-bot-z88j.onrender.com"
 # Пам'ять для кнопок
 LINK_STORAGE = {}
 
-# Дзеркала Cobalt (Instagram Fallback, Threads, Reddit)
+# Розширений список дзеркал Cobalt
 COBALT_MIRRORS = [
     "https://co.wuk.sh/api/json",
     "https://api.cobalt.tools/api/json",
     "https://cobalt.pub/api/json",
-    "https://api.succoon.com/api/json"
+    "https://api.succoon.com/api/json",
+    "https://cobalt.zip/api/json"
 ]
 
 logging.basicConfig(
@@ -83,8 +84,9 @@ def parse_message_data(text):
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text)
     
-    # Нова команда перекладу (t або translate)
-    toggle_trans = ('(t)' in cmd_text or '(translate)' in cmd_text or ' t ' in cmd_text or 'translate' in cmd_text)
+    # Виправлена логіка для 't' (шукаємо окреме слово t або translate)
+    # \b означає "межа слова", щоб "test" не спрацювало, а " t " спрацювало
+    toggle_trans = bool(re.search(r'\b(t|translate)\b', cmd_text))
     
     return found_url, clean_mode, audio_mode, toggle_trans
 
@@ -97,22 +99,21 @@ async def download_content(url):
                 if response.status == 200: return await response.read()
     except: return None
 
-# 🔥 ОНОВЛЕНА ЛОГІКА ПЕРЕКЛАДУ 🔥
+# Оновлена логіка перекладу
 async def translate_text_logic(text, toggle_trans=False):
     if not text or not text.strip(): return ""
     try:
         lang = detect(text)
         
-        # Логіка:
-        # 1. За замовчуванням (toggle_trans=False): EN -> EN, Other -> UK
-        # 2. З командою (toggle_trans=True): EN -> UK, Other -> Other (Original)
-        
+        # Якщо НЕМАЄ команди (t): перекладаємо ВСЕ крім Англійської
         if not toggle_trans:
-            if lang == 'en': return text # Англ залишаємо
-            else: return await asyncio.to_thread(translator.translate, text) # Інші перекладаємо
+            if lang == 'en': return text
+            else: return await asyncio.to_thread(translator.translate, text)
+            
+        # Якщо Є команда (t): перекладаємо ТІЛЬКИ Англійську
         else:
-            if lang == 'en': return await asyncio.to_thread(translator.translate, text) # Англ перекладаємо
-            else: return text # Інші залишаємо в оригіналі
+            if lang == 'en': return await asyncio.to_thread(translator.translate, text)
+            else: return text # Інші мови залишаємо як є
             
     except: pass
     return text
@@ -136,14 +137,17 @@ def extract_audio_from_video(video_bytes):
         return audio_bytes
     except: return None
 
-# --- COBALT API (Universal Helper) ---
-async def get_cobalt_data(user_url):
-    payload = {
-        "url": user_url,
-        "videoQuality": "720",
-        "audioFormat": "mp3",
-        "filenamePattern": "classic"
-    }
+# --- COBALT API (Fix для Threads/Reddit/Insta) ---
+async def get_cobalt_data(user_url, is_youtube=False):
+    payload = {"url": user_url}
+    
+    # Спеціальні параметри тільки для ютуба, інакше інші сервіси ламаються
+    if is_youtube:
+        payload["videoQuality"] = "720"
+        payload["youtubeVideoCodec"] = "h264"
+        payload["audioFormat"] = "mp3"
+        payload["filenamePattern"] = "classic"
+    
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     
     async with aiohttp.ClientSession() as session:
@@ -154,7 +158,9 @@ async def get_cobalt_data(user_url):
                         data = await response.json()
                         if data.get('status') in ['stream', 'redirect', 'picker']:
                             return data
-            except: continue
+            except Exception as e:
+                logging.warning(f"Mirror {mirror} error: {e}")
+                continue
     return None
 
 # --- TASKS ---
@@ -250,13 +256,13 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             if audio_mode and not ('images' in data) and music_file: 
                 await message.answer_audio(music_file, caption="🎵 Звук")
 
-        # --- INSTAGRAM / THREADS / REDDIT (General Logic) ---
-        elif any(x in user_url for x in ["instagram.com", "threads.net", "reddit.com"]):
+        # --- INSTAGRAM / THREADS / REDDIT ---
+        elif any(x in user_url for x in ["instagram.com", "threads", "reddit.com", "redd.it"]):
             
             is_insta = "instagram.com" in user_url
             success = False
             
-            # 1. Для Instagram спочатку пробуємо Instaloader (він краще дає опис/автора)
+            # 1. Instagram через Instaloader (пріоритет)
             if is_insta:
                 try:
                     shortcode = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url).group(1)
@@ -267,7 +273,6 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                     
                     post = await asyncio.to_thread(get_insta)
                     
-                    # Формуємо caption
                     caption_text = None
                     raw_cap = (post.caption or "").split('\n')[0]
                     author_name = post.owner_username
@@ -276,7 +281,6 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                         trans = await translate_text_logic(raw_cap, toggle_trans)
                         caption_text = format_caption(author_name, f"https://instagram.com/{author_name}", trans, user_url)
 
-                    # Завантаження
                     tasks = []
                     if post.typename == 'GraphSidecar':
                         for node in post.get_sidecar_nodes():
@@ -286,11 +290,10 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
                     results = await asyncio.gather(*[t[0] for t in tasks])
                     
-                    # Відправка
+                    # Відправка Insta
                     if len(results) == 1 and results[0]: # Один файл
                         content, is_vid = results[0], tasks[0][1]
                         f = BufferedInputFile(content, filename=f"insta.{'mp4' if is_vid else 'jpg'}")
-                        
                         if is_vid:
                             if audio_mode and not clean_mode:
                                 ab = await asyncio.to_thread(extract_audio_from_video, content)
@@ -320,28 +323,22 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                             
                     success = True
                 except:
-                    logging.warning("Instaloader failed, switching to Cobalt...")
+                    logging.warning("Instaloader failed, trying Cobalt...")
             
-            # 2. FALLBACK або OTHERS (Threads/Reddit) через Cobalt
+            # 2. FALLBACK або THREADS/REDDIT через Cobalt
             if not success:
-                cobalt_data = await get_cobalt_data(user_url)
-                if not cobalt_data: raise Exception("API Error")
+                cobalt_data = await get_cobalt_data(user_url, is_youtube=False)
+                if not cobalt_data: raise Exception("API Error (Cobalt)")
                 
-                # Спробуємо дістати дані (Cobalt іноді дає назву)
-                title_text = ""
-                # Threads/Reddit/Insta Cobalt не завжди дають автора, тому ставимо заглушку або домен
+                # Визначаємо домен для красивого підпису
                 domain = "Threads" if "threads" in user_url else "Reddit" if "reddit" in user_url else "Instagram"
-                author_name = domain 
                 
-                # Якщо це Reddit/Threads, спробуємо знайти текст в відповіді, але зазвичай там просто файл
-                # Тому робимо базовий підпис
                 caption_text = None
                 if not clean_mode:
                     caption_text = f"📄 <b>{domain} Post</b>\n🔗 <a href='{user_url}'>Оригінал</a>"
 
-                # Обробка результату
+                # Picker (Галерея)
                 if cobalt_data.get('status') == 'picker':
-                    # Галерея
                     mg = MediaGroupBuilder()
                     tasks = [download_content(item['url']) for item in cobalt_data['picker']]
                     files = await asyncio.gather(*tasks)
@@ -360,8 +357,8 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                     await message.answer_media_group(mg.build())
                     if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
 
+                # Stream/Redirect (Один файл)
                 else:
-                    # Один файл
                     media_url = cobalt_data.get('url')
                     content = await download_content(media_url)
                     if content:
@@ -423,6 +420,50 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 await message.answer_media_group(mg.build())
                 if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
 
+        # --- YOUTUBE ---
+        elif "youtube.com" in user_url or "youtu.be" in user_url:
+            if not is_button_click: await status_msg.edit_text("📺 YouTube: Завантажую...")
+            
+            if not os.path.exists("downloads"): os.makedirs("downloads")
+            # Передаємо is_youtube=True для Cobalt
+            cobalt_data = await get_cobalt_data(user_url, is_youtube=True)
+            
+            if not cobalt_data: 
+                await status_msg.edit_text("❌ Всі сервери зайняті або відео недоступне.")
+                return
+            
+            direct_url = cobalt_data.get('url')
+            raw_path = f"downloads/raw_{uuid.uuid4()}.mp4"
+            
+            with open(raw_path, 'wb') as f:
+                f.write(await download_content(direct_url))
+            
+            final_path = raw_path
+            
+            # Нарізка (cut_range) - це фіча YouTube, тому тут лишаємо
+            if cut_range:
+                final_path = f"downloads/final_{uuid.uuid4()}.mp4"
+                await asyncio.to_thread(process_media_locally, raw_path, final_path, False, cut_range)
+
+            # Аудіо
+            if audio_mode:
+                audio_path = f"downloads/aud_{uuid.uuid4()}.mp3"
+                await asyncio.to_thread(process_media_locally, final_path, audio_path, True, None)
+                await message.answer_audio(FSInputFile(audio_path), caption="🎵 Звук з YouTube")
+                if os.path.exists(audio_path): os.remove(audio_path)
+            
+            # Відео
+            else:
+                caption_text = None
+                if not clean_mode:
+                    caption_text = f"📺 <b>YouTube Video</b>\n\n🔗 <a href='{user_url}'>Оригінал</a>"
+                
+                kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode and not cut_range) else None
+                await message.answer_video(FSInputFile(final_path), caption=caption_text, parse_mode="HTML", reply_markup=kb)
+
+            if os.path.exists(raw_path): os.remove(raw_path)
+            if os.path.exists(final_path) and final_path != raw_path: os.remove(final_path)
+
         if status_msg: await status_msg.delete()
 
     except Exception as e:
@@ -435,7 +476,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Я качаю з TikTok, Instagram, Twitter, Threads та Reddit.")
+    await message.answer("Привіт! Я качаю з TikTok, Instagram, Twitter, Threads, Reddit та YouTube.")
 
 @dp.callback_query()
 async def on_button_click(callback: CallbackQuery):
