@@ -24,7 +24,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Дзеркала Cobalt (тільки як запасний варіант)
+# Дзеркала Cobalt (лише як запасний варіант для Інстаграму)
 COBALT_MIRRORS = [
     "https://co.wuk.sh/api/json",
     "https://api.cobalt.tools/api/json",
@@ -32,7 +32,7 @@ COBALT_MIRRORS = [
     "https://api.succoon.com/api/json"
 ]
 
-# Кеш для роботи кнопок
+# Кеш для роботи кнопок (щоб працював переклад туди-сюди)
 CACHE = {}
 
 logging.basicConfig(
@@ -62,7 +62,7 @@ def get_keyboard(cache_key, content_type='video', current_lang='orig'):
     
     buttons.append(row1)
     
-    # Рядок 2: Переклад
+    # Рядок 2: Переклад (якщо є текст і він різний)
     data = CACHE.get(cache_key)
     if data and data.get('orig_text') and data.get('trans_text') and data['orig_text'] != data['trans_text']:
         if current_lang == 'orig':
@@ -108,7 +108,7 @@ async def prepare_text_data(text):
         lang = detect(text)
         if lang != 'uk':
             trans = await asyncio.to_thread(translator.translate, text)
-            return text, trans
+            return text, trans # (Оригінал, Переклад)
         return text, text
     except:
         return text, text
@@ -132,7 +132,7 @@ def extract_audio_from_video(video_bytes):
         return audio_bytes
     except: return None
 
-# --- COBALT API ---
+# --- COBALT API (Тільки для Instagram Fallback) ---
 async def get_cobalt_data(user_url):
     payload = {"url": user_url}
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -146,13 +146,15 @@ async def get_cobalt_data(user_url):
             except: continue
     return None
 
-# --- PING ---
+# --- WEB & PING ---
 async def keep_alive_ping():
+    logging.info("🚀 Ping service started!")
     await asyncio.sleep(10)
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(RENDER_URL) as response: pass
+                async with session.get(RENDER_URL) as response:
+                    logging.info(f"🔔 Self-Ping status: {response.status}")
         except: pass
         await asyncio.sleep(120)
 
@@ -208,7 +210,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 is_video = True
                 final_video = await download_content(data.get('hdplay') or data.get('play'))
 
-        # --- TWITTER (X) - Старий добрий fxtwitter ---
+        # --- TWITTER (X) - Старий перевірений метод ---
         elif "twitter.com" in user_url or "x.com" in user_url:
             match = re.search(r"/status/(\d+)", user_url)
             if not match: raise Exception("No ID")
@@ -231,10 +233,8 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 vid = next(m for m in media if m['type'] in ['video','gif'])
                 final_video = await download_content(vid['url'])
             else:
-                # Галерея фото
                 tasks = [download_content(m['url']) for m in media]
                 final_gallery = await asyncio.gather(*tasks)
-                # Якщо фото одне
                 if len(final_gallery) == 1:
                     final_photo = final_gallery[0]
                     final_gallery = []
@@ -271,14 +271,12 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 success = True
             except: pass
             
-            # 2. Cobalt (Якщо Instaloader заблокований)
+            # 2. Cobalt (Fallback)
             if not success:
                 c_data = await get_cobalt_data(user_url)
                 if not c_data: raise Exception("API Error")
                 
-                # При спробі Cobalt автора витягнути важко, ставимо дефолт
-                author_name = "Instagram User"
-                author_link = user_url
+                author_name = "Instagram User" # Cobalt часто не дає автора
                 
                 if c_data.get('status') == 'picker':
                     tasks = [download_content(i['url']) for i in c_data['picker']]
@@ -319,6 +317,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
         # Стандартний режим
         caption = format_caption(author_name, author_link, orig_text, user_url)
+        sent_msg = None
         
         # Дані для кешу
         cache_data = {
@@ -332,7 +331,8 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             'photo': final_photo,
             'gallery': final_gallery,
             'audio': final_audio,
-            'audio_name': audio_filename
+            'audio_name': audio_filename,
+            'is_gallery_text': False
         }
 
         # 1. ВІДЕО
@@ -363,7 +363,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 reply_markup=get_keyboard(key, 'photo', 'orig')
             )
 
-        # 3. ГАЛЕРЕЯ (МЕГА ФІКС)
+        # 3. ГАЛЕРЕЯ
         elif final_gallery:
             mg = MediaGroupBuilder()
             for i, b in enumerate(final_gallery):
@@ -372,12 +372,11 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             # Відправляємо альбом
             await message.answer_media_group(mg.build())
             
-            # Текст і кнопки - ОКРЕМИМ повідомленням
-            # Це вирішує проблему "no caption to edit"
+            # Текст і кнопки - ОКРЕМИМ повідомленням (Щоб уникнути помилки "no caption to edit")
             sent_msg = await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
             
             key = f"{sent_msg.chat.id}:{sent_msg.message_id}"
-            cache_data['is_gallery_text'] = True # Маркер, що це окремий текст
+            cache_data['is_gallery_text'] = True # Маркер для обробника кнопок
             CACHE[key] = cache_data
             
             await bot.edit_message_reply_markup(
@@ -385,7 +384,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 reply_markup=get_keyboard(key, 'photo', 'orig')
             )
 
-        # Авто-аудіо (для фото/галерей)
+        # Авто-аудіо для фото
         if (final_photo or final_gallery) and final_audio:
             await message.answer_audio(BufferedInputFile(final_audio, filename=audio_filename))
 
@@ -393,7 +392,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        if status_msg: await status_msg.edit_text("❌ Помилка завантаження.")
+        if status_msg: await status_msg.edit_text("❌ Помилка. Перевірте посилання.")
 
 # --- ОБРОБКА КНОПОК ---
 @dp.callback_query()
@@ -442,7 +441,7 @@ async def handle_callbacks(callback: CallbackQuery):
             is_video = (data.get('video') is not None)
             ctype = 'video' if is_video else 'photo'
             
-            # Якщо це текст під галереєю - редагуємо текст, інакше - підпис
+            # Якщо це текст під галереєю (окреме повідомлення) - використовуємо edit_message_text
             if data.get('is_gallery_text'):
                 await bot.edit_message_text(
                     chat_id=callback.message.chat.id,
@@ -452,6 +451,7 @@ async def handle_callbacks(callback: CallbackQuery):
                     disable_web_page_preview=True,
                     reply_markup=get_keyboard(key, ctype, new_lang)
                 )
+            # Якщо це підпис під медіа - використовуємо edit_message_caption
             else:
                 await bot.edit_message_caption(
                     chat_id=callback.message.chat.id,
