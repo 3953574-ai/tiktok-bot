@@ -69,11 +69,9 @@ def get_video_keyboard(data_id, current_mode='trans'):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_photo_keyboard(data_id, current_mode='trans'):
-    # Змінив емоджі як ти просив
     buttons = [
         [InlineKeyboardButton(text="🖼️ Тільки фото", callback_data=f"pho_clean:{data_id}")]
     ]
-    
     data = STORAGE.get(data_id)
     if data and data.get('has_diff'):
         if current_mode == 'trans':
@@ -166,8 +164,7 @@ async def keep_alive_ping():
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(RENDER_URL) as response:
-                    logging.info(f"🔔 Self-Ping status: {response.status}")
+                async with session.get(RENDER_URL) as response: pass
         except: pass
         await asyncio.sleep(120)
 
@@ -193,7 +190,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
     try:
         video_bytes = None
         photo_bytes = None
-        gallery_data = [] # Список кортежів (bytes, type='photo'|'video')
+        gallery_data = [] 
         audio_bytes = None
         
         author_name = "User"
@@ -234,7 +231,6 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             tw_id = match.group(1)
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"https://api.vxtwitter.com/Twitter/status/{tw_id}") as r:
-                    if r.status != 200: raise Exception("Twitter API Error")
                     tweet = await r.json()
 
             author_name = tweet.get('user_name', 'User')
@@ -258,74 +254,45 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
         # --- INSTAGRAM / THREADS / REDDIT ---
         elif any(x in user_url for x in ["instagram.com", "threads", "reddit.com", "redd.it"]):
-            success = False
-            
-            # 1. Instaloader (тільки для Instagram)
+            # Спробуємо Instaloader тільки для метаданих (тексту), бо медіа він часто не дає
             if "instagram.com" in user_url:
                 try:
                     shortcode = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url).group(1)
-                    def get_insta():
+                    def get_meta():
                         L = instaloader.Instaloader(quiet=True)
                         L.context._user_agent = "Instagram 269.0.0.18.75 Android"
                         return instaloader.Post.from_shortcode(L.context, shortcode)
-                    
-                    post = await asyncio.to_thread(get_insta)
+                    post = await asyncio.to_thread(get_meta)
                     author_name = post.owner_username
                     author_link = f"https://instagram.com/{author_name}"
                     raw_desc = (post.caption or "").split('\n')[0]
                     audio_name = f"{author_name}.mp3"
+                except: pass
 
-                    # Обробка галерей (ВІДЕО ТА ФОТО)
-                    if post.typename == 'GraphSidecar':
-                        tasks = []
-                        types_list = []
-                        for node in post.get_sidecar_nodes():
-                            url = node.video_url if node.is_video else node.display_url
-                            t = 'video' if node.is_video else 'photo'
-                            tasks.append(download_content(url))
-                            types_list.append(t)
-                        
-                        files = await asyncio.gather(*tasks)
-                        for i, f in enumerate(files):
-                            if f: gallery_data.append((f, types_list[i]))
-                            
-                    else:
-                        url = post.video_url if post.is_video else post.url
-                        content = await download_content(url)
-                        if post.is_video: video_bytes = content
-                        else: photo_bytes = content
-                    success = True
-                except:
-                    logging.warning("Instaloader failed, switching to Cobalt...")
+            # Качаємо медіа через Cobalt (найнадійніше)
+            c_data = await get_cobalt_data(user_url)
+            if not c_data: raise Exception("API Error")
             
-            # 2. Cobalt Fallback
-            if not success:
-                c_data = await get_cobalt_data(user_url)
-                if not c_data: raise Exception("API Error")
+            if "User" in author_name: author_name = "User" # Якщо Instaloader не спрацював
+
+            if c_data.get('status') == 'picker':
+                tasks = [download_content(i['url']) for i in c_data['picker']]
+                files = await asyncio.gather(*tasks)
+                for i, f in enumerate(files):
+                    if f:
+                        item_type = 'video' if c_data['picker'][i].get('type') == 'video' else 'photo'
+                        gallery_data.append((f, item_type))
                 
-                author_name = "User" # Cobalt рідко дає автора для Інсти
-                audio_name = "instagram_audio.mp3"
+                # Аудіо з Інсти
+                audio_item = next((i for i in c_data['picker'] if i.get('type') == 'audio'), None)
+                if audio_item: audio_bytes = await download_content(audio_item['url'])
 
-                if c_data.get('status') == 'picker':
-                    tasks = [download_content(i['url']) for i in c_data['picker']]
-                    files = await asyncio.gather(*tasks)
-                    for i, f in enumerate(files):
-                        if f:
-                            # Визначаємо тип по розширенню або метаданим
-                            item_type = 'video' if c_data['picker'][i].get('type') == 'video' else 'photo'
-                            gallery_data.append((f, item_type))
-                            
-                    # Спробуємо знайти аудіо в picker (Cobalt іноді дає окремо)
-                    audio_item = next((i for i in c_data['picker'] if i.get('type') == 'audio'), None)
-                    if audio_item:
-                        audio_bytes = await download_content(audio_item['url'])
-
-                else:
-                    url = c_data.get('url')
-                    content = await download_content(url)
-                    is_vid = ".mp4" in url or "video" in c_data.get('filename', '')
-                    if is_vid: video_bytes = content
-                    else: photo_bytes = content
+            else:
+                url = c_data.get('url')
+                content = await download_content(url)
+                is_vid = ".mp4" in url or "video" in c_data.get('filename', '')
+                if is_vid: video_bytes = content
+                else: photo_bytes = content
 
         # --- ВІДПРАВКА ---
         
@@ -336,14 +303,11 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             if video_bytes: await message.answer_video(BufferedInputFile(video_bytes, filename="video.mp4"))
             elif photo_bytes: await message.answer_photo(BufferedInputFile(photo_bytes, filename="photo.jpg"))
             elif gallery_data:
-                # Розбиваємо галерею по 10 штук
-                chunks = [gallery_data[i:i + 10] for i in range(0, len(gallery_data), 10)]
-                for chunk in chunks:
-                    mg = MediaGroupBuilder()
-                    for content, ctype in chunk:
-                        if ctype == 'video': mg.add_video(BufferedInputFile(content, filename="vid.mp4"))
-                        else: mg.add_photo(BufferedInputFile(content, filename="img.jpg"))
-                    await message.answer_media_group(mg.build())
+                mg = MediaGroupBuilder()
+                for content, ctype in gallery_data:
+                    if ctype == 'video': mg.add_video(BufferedInputFile(content, filename="vid.mp4"))
+                    else: mg.add_photo(BufferedInputFile(content, filename="img.jpg"))
+                await message.answer_media_group(mg.build())
             
             if status_msg: await status_msg.delete()
             return
@@ -396,41 +360,29 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 parse_mode="HTML"
             )
             kb = get_photo_keyboard(data_id, current_mode=force_lang)
-            # Прикріпляємо кнопки прямо до фото
+            # Кнопки до фото
             await bot.edit_message_reply_markup(
                 chat_id=sent.chat.id, message_id=sent.message_id,
                 reply_markup=kb
             )
 
-        # --- ГАЛЕРЕЯ (ФОТО + ВІДЕО) ---
+        # --- ГАЛЕРЕЯ ---
         elif gallery_data:
-            chunks = [gallery_data[i:i + 10] for i in range(0, len(gallery_data), 10)]
+            mg = MediaGroupBuilder()
+            for i, (content, ctype) in enumerate(gallery_data):
+                cap = caption if i == 0 else None
+                if ctype == 'video': mg.add_video(BufferedInputFile(content, filename="v.mp4"), caption=cap, parse_mode="HTML")
+                else: mg.add_photo(BufferedInputFile(content, filename="p.jpg"), caption=cap, parse_mode="HTML")
             
-            for i, chunk in enumerate(chunks):
-                mg = MediaGroupBuilder()
-                for j, (content, ctype) in enumerate(chunk):
-                    # Підпис тільки для самого першого елемента найпершого чанку
-                    cap = caption if (i == 0 and j == 0) else None
-                    if ctype == 'video':
-                        mg.add_video(BufferedInputFile(content, filename="v.mp4"), caption=cap, parse_mode="HTML")
-                    else:
-                        mg.add_photo(BufferedInputFile(content, filename="p.jpg"), caption=cap, parse_mode="HTML")
-                
-                await message.answer_media_group(mg.build())
+            await message.answer_media_group(mg.build())
             
             kb = get_photo_keyboard(data_id, current_mode=force_lang)
             
-            # Якщо є аудіо -> кнопки до аудіо
             if audio_bytes:
-                await message.answer_audio(
-                    BufferedInputFile(audio_bytes, filename=audio_name),
-                    reply_markup=kb
-                )
+                await message.answer_audio(BufferedInputFile(audio_bytes, filename=audio_name), reply_markup=kb)
             else:
-                # Якщо немає аудіо -> окреме маленьке повідомлення для кнопок
-                await message.answer("⚙️", reply_markup=kb)
+                await message.answer("⠀", reply_markup=kb)
 
-        # Якщо є аудіо окремо (і це не галерея, де ми вже відправили)
         if (photo_bytes) and audio_bytes:
             await message.answer_audio(BufferedInputFile(audio_bytes, filename=audio_name))
 
@@ -452,7 +404,6 @@ async def handle_callbacks(callback: CallbackQuery):
             data_id = parts[1]
             data = STORAGE.get(data_id)
             if data and data.get('file_id'):
-                # Відправляємо новим повідомленням
                 await callback.message.answer_video(data['file_id']) 
             else:
                 await callback.answer("Файл втрачено", show_alert=True)
@@ -471,7 +422,6 @@ async def handle_callbacks(callback: CallbackQuery):
             target_lang = parts[1] 
             data_id = parts[2]
             data = STORAGE.get(data_id)
-            
             if data:
                 text = data['trans_text'] if target_lang == 'trans' else data['orig_text']
                 new_cap = format_caption(data['author_name'], data['author_link'], text, data['user_url'])
@@ -515,7 +465,6 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text.regexp(r'(https?://[^\s]+)'))
 async def handle_link(message: types.Message):
     user_url, clean, audio = parse_message_data(message.text)
-    # По замовчуванню 'trans' (перекладено)
     await process_media_request(message, user_url, clean, audio, force_lang='trans')
 
 async def main():
