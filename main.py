@@ -6,7 +6,7 @@ import re
 import uuid
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import FSInputFile, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto, InputMediaVideo
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
@@ -24,17 +24,18 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Пам'ять для кнопок
-LINK_STORAGE = {}
-
-# Дзеркала Cobalt (Threads, Reddit, Insta Fallback, YouTube)
+# Дзеркала Cobalt (для підстраховки)
 COBALT_MIRRORS = [
     "https://co.wuk.sh/api/json",
     "https://api.cobalt.tools/api/json",
     "https://cobalt.pub/api/json",
-    "https://api.succoon.com/api/json",
-    "https://cobalt.zip/api/json"
+    "https://api.succoon.com/api/json"
 ]
+
+# --- ПАМ'ЯТЬ (CACHE) ---
+# Зберігаємо дані про пости, щоб кнопки працювали "на льоту"
+# key = f"{chat_id}:{message_id}"
+CACHE = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,50 +44,60 @@ logging.basicConfig(
 )
 
 if not BOT_TOKEN:
-    raise ValueError("Не знайдено BOT_TOKEN у змінних оточення!")
+    raise ValueError("Не знайдено BOT_TOKEN!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 translator = GoogleTranslator(source='auto', target='uk')
 
-# --- КЛАВІАТУРИ ---
-def get_media_keyboard(url, content_type='video'):
-    link_id = str(uuid.uuid4())[:8]
-    LINK_STORAGE[link_id] = url
-    
+# --- КЛАВІАТУРА ---
+def get_keyboard(cache_key, content_type='video', current_lang='orig'):
     buttons = []
-    clean_btn = InlineKeyboardButton(text="🙈 Без підписів", callback_data=f"clean:{link_id}")
+    
+    # Рядок 1: Аудіо та Чистий файл
+    row1 = []
+    row1.append(InlineKeyboardButton(text="🎵 Аудіо", callback_data="get_audio"))
     
     if content_type == 'video':
-        audio_btn = InlineKeyboardButton(text="🎵 + Аудіо", callback_data=f"audio:{link_id}")
-        buttons.append([audio_btn, clean_btn])
+        row1.append(InlineKeyboardButton(text="🎬 Відео", callback_data="get_clean"))
     else:
-        # Для фото тільки кнопка очистки
-        buttons.append([clean_btn])
+        row1.append(InlineKeyboardButton(text="🖼 Фото", callback_data="get_clean"))
     
+    buttons.append(row1)
+    
+    # Рядок 2: Переклад (якщо є текст)
+    # Перевіряємо в кеші, чи відрізняється оригінал від перекладу
+    data = CACHE.get(cache_key)
+    if data and data.get('orig_text') and data.get('trans_text') and data['orig_text'] != data['trans_text']:
+        if current_lang == 'orig':
+            buttons.append([InlineKeyboardButton(text="🇺🇦 Переклад", callback_data="toggle_lang")])
+        else:
+            buttons.append([InlineKeyboardButton(text="🌐 Оригінал", callback_data="toggle_lang")])
+        
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 
 def sanitize_filename(name):
     if not name: return "audio"
+    # Залишаємо букви, цифри і прості знаки
     name = re.sub(r'[\\/*?:"<>|]', "", str(name))
     name = name.replace('\n', ' ').strip()
     return name[:50]
 
 def parse_message_data(text):
-    if not text: return None, False, False, False
+    if not text: return None, False, False
     url_match = re.search(r'(https?://[^\s]+)', text)
-    if not url_match: return None, False, False, False
+    if not url_match: return None, False, False
     
     found_url = url_match.group(1)
     cmd_text = text.replace(found_url, "").lower()
     
+    # Ручні команди (залишаємо як "бекдор" для просунутих)
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text)
-    toggle_trans = bool(re.search(r'\b(t|translate)\b', cmd_text))
     
-    return found_url, clean_mode, audio_mode, toggle_trans
+    return found_url, clean_mode, audio_mode
 
 async def download_content(url):
     if not url: return None
@@ -97,24 +108,22 @@ async def download_content(url):
                 if response.status == 200: return await response.read()
     except: return None
 
-async def translate_text_logic(text, toggle_trans=False):
-    if not text or not text.strip(): return ""
+async def prepare_translation(text):
+    if not text: return "", ""
     try:
         lang = detect(text)
-        if not toggle_trans:
-            if lang == 'en': return text
-            else: return await asyncio.to_thread(translator.translate, text)
-        else:
-            if lang == 'en': return await asyncio.to_thread(translator.translate, text)
-            else: return text 
-    except: pass
-    return text
+        if lang != 'uk':
+            trans = await asyncio.to_thread(translator.translate, text)
+            return text, trans # Оригінал, Переклад
+        return text, text # Якщо вже укр, то однаково
+    except:
+        return text, text
 
-def format_caption(nickname, profile_url, title, original_url):
-    caption = f"👤 <a href='{profile_url}'><b>{nickname}</b></a>\n\n"
-    if title: caption += f"📝 {title}\n\n"
+def format_caption(author_name, author_url, text, original_url):
+    caption = f"👤 <a href='{author_url}'><b>{author_name}</b></a>\n\n"
+    if text: caption += f"📝 {text}\n\n"
     caption += f"🔗 <a href='{original_url}'>Оригінал</a>"
-    return caption[:1000] + "..." if len(caption) > 1024 else caption
+    return caption[:1024] # Ліміт телеграма
 
 def extract_audio_from_video(video_bytes):
     try:
@@ -129,12 +138,9 @@ def extract_audio_from_video(video_bytes):
         return audio_bytes
     except: return None
 
-# --- COBALT API ---
-async def get_cobalt_data(user_url, is_youtube=False):
+# --- COBALT API (Fallback) ---
+async def get_cobalt_data(user_url):
     payload = {"url": user_url}
-    if is_youtube:
-        payload.update({"videoQuality":"720","youtubeVideoCodec":"h264","audioFormat":"mp3","filenamePattern":"classic"})
-    
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     async with aiohttp.ClientSession() as session:
         for mirror in COBALT_MIRRORS:
@@ -146,7 +152,7 @@ async def get_cobalt_data(user_url, is_youtube=False):
             except: continue
     return None
 
-# --- TASKS ---
+# --- ФОНОВІ ЗАДАЧІ ---
 async def keep_alive_ping():
     logging.info("🚀 Ping service started!")
     await asyncio.sleep(10)
@@ -167,80 +173,57 @@ async def start_web_server():
     await site.start()
 
 # ==========================================
-# 🔥 ЛОГІКА ОБРОБКИ 🔥
+# 🔥 ГОЛОВНА ЛОГІКА 🔥
 # ==========================================
 
-async def process_media_request(message: types.Message, user_url, clean_mode=False, audio_mode=False, toggle_trans=False, is_button_click=False):
-    if not is_button_click:
-        status_msg = await message.reply("⏳ Обробляю...")
-    else:
-        status_msg = None
+async def process_media_request(message: types.Message, user_url, clean_mode=False, audio_mode=False):
+    status_msg = await message.reply("⏳ Обробляю...")
 
     try:
+        # Змінні для кешу
+        final_video = None
+        final_photo = None
+        final_gallery = [] # Список байтів
+        final_audio = None
+        
+        author_name = "User"
+        author_link = user_url
+        raw_desc = ""
+        is_video = False
+        audio_filename = "audio.mp3"
+
         # --- TIKTOK ---
         if "tiktok.com" in user_url:
             async with aiohttp.ClientSession() as session:
                 async with session.post(TIKTOK_API_URL, data={'url': user_url, 'hd': 1}) as r:
                     data = (await r.json())['data']
             
-            caption_text = None
             author_name = data['author']['nickname']
-            title_text = data.get('title', '')
+            unique_id = data['author']['unique_id']
+            author_link = f"https://www.tiktok.com/@{unique_id}"
+            raw_desc = data.get('title', '')
             
-            if not clean_mode:
-                trans = await translate_text_logic(title_text, toggle_trans)
-                unique_id = data['author']['unique_id']
-                caption_text = format_caption(author_name, f"https://www.tiktok.com/@{unique_id}", trans, user_url)
-
-            music_file = None
-            should_dl_audio = audio_mode or ('images' in data and data['images'])
+            # Аудіо (ім'я файлу)
+            m_author = data.get('music_info', {}).get('author', author_name)
+            m_title = data.get('music_info', {}).get('title', 'Audio')
+            audio_filename = f"{sanitize_filename(m_author)} - {sanitize_filename(m_title)}.mp3"
             
-            if should_dl_audio:
-                mb = await download_content(data.get('music'))
-                if mb:
-                    m_author = data.get('music_info', {}).get('author', author_name)
-                    m_title = data.get('music_info', {}).get('title', 'Audio')
-                    fname = f"{sanitize_filename(m_author)} - {sanitize_filename(m_title)}.mp3"
-                    music_file = BufferedInputFile(mb, filename=fname)
+            mb = await download_content(data.get('music'))
+            if mb: final_audio = mb
 
             if 'images' in data and data['images']:
                 tasks = [download_content(u) for u in data['images']]
-                imgs = await asyncio.gather(*tasks)
-                mg = MediaGroupBuilder()
-                for i, img in enumerate(imgs):
-                    if img:
-                        f = BufferedInputFile(img, filename=f"i{i}.jpg")
-                        if i==0 and caption_text: mg.add_photo(f, caption=caption_text, parse_mode="HTML")
-                        else: mg.add_photo(f)
-                
-                await message.answer_media_group(mg.build())
-                
-                kb = get_media_keyboard(user_url, content_type='photo') if not clean_mode else None
-                if music_file and not clean_mode: await message.answer_audio(music_file, reply_markup=kb)
-                elif not clean_mode: await message.answer("Опції:", reply_markup=kb)
-
+                final_gallery = await asyncio.gather(*tasks)
             else:
-                vid_url = data.get('hdplay') or data.get('play')
-                vb = await download_content(vid_url)
-                if vb:
-                    kb = get_media_keyboard(user_url, content_type='video') if (not clean_mode and not audio_mode) else None
-                    await message.answer_video(
-                        BufferedInputFile(vb, filename="tiktok.mp4"), 
-                        caption=caption_text, 
-                        parse_mode="HTML", 
-                        reply_markup=kb
-                    )
-            
-            if audio_mode and not ('images' in data) and music_file: 
-                await message.answer_audio(music_file)
+                is_video = True
+                final_video = await download_content(data.get('hdplay') or data.get('play'))
 
-        # --- INSTAGRAM, THREADS, REDDIT (Logic with Fallback) ---
-        elif any(x in user_url for x in ["instagram.com", "threads", "reddit.com", "redd.it"]):
-            
+        # --- INSTAGRAM / TWITTER ---
+        elif any(x in user_url for x in ["instagram.com", "twitter.com", "x.com"]):
             is_insta = "instagram.com" in user_url
             success = False
             
-            # 1. Instagram Instaloader
+            # Instaloader
             if is_insta:
                 try:
                     shortcode = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url).group(1)
@@ -250,265 +233,227 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                         return instaloader.Post.from_shortcode(L.context, shortcode)
                     
                     post = await asyncio.to_thread(get_insta)
-                    
-                    caption_text = None
-                    raw_cap = (post.caption or "").split('\n')[0]
                     author_name = post.owner_username
-                    
-                    if not clean_mode:
-                        trans = await translate_text_logic(raw_cap, toggle_trans)
-                        caption_text = format_caption(author_name, f"https://instagram.com/{author_name}", trans, user_url)
+                    author_link = f"https://instagram.com/{author_name}"
+                    raw_desc = (post.caption or "").split('\n')[0]
+                    audio_filename = f"{author_name}.mp3"
 
-                    tasks = []
                     if post.typename == 'GraphSidecar':
+                        tasks = []
                         for node in post.get_sidecar_nodes():
-                            tasks.append((download_content(node.video_url if node.is_video else node.display_url), node.is_video))
+                            url = node.video_url if node.is_video else node.display_url
+                            tasks.append(download_content(url))
+                        final_gallery = await asyncio.gather(*tasks)
                     else:
-                        tasks.append((download_content(post.video_url if post.is_video else post.url), post.is_video))
-
-                    results = await asyncio.gather(*[t[0] for t in tasks])
-                    
-                    # Відправка Insta
-                    if len(results) == 1 and results[0]: # Один файл
-                        content, is_vid = results[0], tasks[0][1]
-                        f = BufferedInputFile(content, filename=f"insta.{'mp4' if is_vid else 'jpg'}")
-                        if is_vid:
-                            if audio_mode and not clean_mode:
-                                ab = await asyncio.to_thread(extract_audio_from_video, content)
-                                if ab: await message.answer_audio(BufferedInputFile(ab, filename=f"{author_name}.mp3"))
-                            else:
-                                kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
-                                await message.answer_video(f, caption=caption_text, parse_mode="HTML", reply_markup=kb)
-                        else:
-                            await message.answer_photo(f, caption=caption_text, parse_mode="HTML")
-                            if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
-                    
-                    elif len(results) > 1: # Галерея
-                        mg = MediaGroupBuilder()
-                        for i, content in enumerate(results):
-                            if content:
-                                is_vid = tasks[i][1]
-                                f = BufferedInputFile(content, filename=f"m{i}.{'mp4' if is_vid else 'jpg'}")
-                                if i==0 and caption_text: 
-                                    if is_vid: mg.add_video(f, caption=caption_text, parse_mode="HTML")
-                                    else: mg.add_photo(f, caption=caption_text, parse_mode="HTML")
-                                else:
-                                    if is_vid: mg.add_video(f)
-                                    else: mg.add_photo(f)
-                        await message.answer_media_group(mg.build())
-                        if not clean_mode and not audio_mode:
-                            await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
-                            
+                        is_video = post.is_video
+                        url = post.video_url if is_video else post.url
+                        content = await download_content(url)
+                        if is_video: final_video = content
+                        else: final_photo = content
                     success = True
                 except: pass
             
-            # 2. Threads / Reddit / Fallback
+            # Cobalt (Fallback + Twitter)
             if not success:
-                # Спочатку пробуємо yt-dlp для Threads/Reddit (він краще тягне відео)
-                yt_dlp_success = False
-                if not is_insta:
-                    try:
-                        ydl_opts = {
-                            'quiet': True, 'no_warnings': True, 'format': 'best',
-                            'outtmpl': f'downloads/%(id)s.%(ext)s',
-                            # Fix для Reddit/Threads:
-                            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-                        }
-                        if not os.path.exists("downloads"): os.makedirs("downloads")
-                        
-                        info = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(user_url, download=True))
-                        
-                        files = glob.glob(f"downloads/{info['id']}*")
-                        if files:
-                            file_path = files[0]
-                            is_video = file_path.endswith(('.mp4', '.mkv', '.webm'))
-                            
-                            author_name = info.get('uploader') or "User"
-                            text_desc = info.get('description') or info.get('title') or ""
-                            
-                            caption_text = None
-                            if not clean_mode:
-                                trans = await translate_text_logic(text_desc, toggle_trans)
-                                domain = "reddit.com" if "reddit" in user_url else "threads.net"
-                                profile_link = user_url 
-                                caption_text = format_caption(author_name, profile_link, trans, user_url)
+                c_data = await get_cobalt_data(user_url)
+                if not c_data: raise Exception("API Error")
+                
+                if "twitter" in user_url or "x.com" in user_url:
+                    author_name = "Twitter User"
+                    author_link = user_url
+                    audio_filename = "twitter_audio.mp3"
+                
+                if c_data.get('status') == 'picker':
+                    tasks = [download_content(i['url']) for i in c_data['picker']]
+                    final_gallery = await asyncio.gather(*tasks)
+                else:
+                    url = c_data.get('url')
+                    content = await download_content(url)
+                    is_video = ".mp4" in url or "video" in c_data.get('filename', '')
+                    if is_video: final_video = content
+                    else: final_photo = content
 
-                            f = FSInputFile(file_path)
-                            
-                            if is_video:
-                                if audio_mode and not clean_mode:
-                                    aud_path = f"downloads/{info['id']}.mp3"
-                                    subprocess.run(['ffmpeg', '-y', '-i', file_path, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', aud_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                    await message.answer_audio(FSInputFile(aud_path))
-                                    os.remove(aud_path)
-                                else:
-                                    kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
-                                    await message.answer_video(f, caption=caption_text, parse_mode="HTML", reply_markup=kb)
-                            else:
-                                await message.answer_photo(f, caption=caption_text, parse_mode="HTML")
-                                if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
-                            
-                            os.remove(file_path)
-                            yt_dlp_success = True
-                    except Exception as e:
-                        logging.warning(f"yt-dlp failed for {user_url}: {e}")
-
-                # 3. COBALT
-                if not yt_dlp_success:
-                    cobalt_data = await get_cobalt_data(user_url, is_youtube=False)
-                    if not cobalt_data: raise Exception("API Error")
-                    
-                    domain = "Threads" if "threads" in user_url else "Reddit" if "reddit" in user_url else "Instagram"
-                    caption_text = None
-                    if not clean_mode:
-                        caption_text = f"📄 <b>{domain} Post</b>\n🔗 <a href='{user_url}'>Оригінал</a>"
-
-                    if cobalt_data.get('status') == 'picker':
-                        mg = MediaGroupBuilder()
-                        tasks = [download_content(item['url']) for item in cobalt_data['picker']]
-                        files = await asyncio.gather(*tasks)
-                        
-                        for i, content in enumerate(files):
-                            if content:
-                                is_vid = (cobalt_data['picker'][i]['type'] == 'video')
-                                f = BufferedInputFile(content, filename=f"c{i}.{'mp4' if is_vid else 'jpg'}")
-                                if i==0 and caption_text:
-                                    if is_vid: mg.add_video(f, caption=caption_text, parse_mode="HTML")
-                                    else: mg.add_photo(f, caption=caption_text, parse_mode="HTML")
-                                else:
-                                    if is_vid: mg.add_video(f)
-                                    else: mg.add_photo(f)
-                        await message.answer_media_group(mg.build())
-                        if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
-
-                    else:
-                        media_url = cobalt_data.get('url')
-                        content = await download_content(media_url)
-                        if content:
-                            is_vid = ".mp4" in media_url or "video" in cobalt_data.get('filename', '')
-                            f = BufferedInputFile(content, filename=f"file.{'mp4' if is_vid else 'jpg'}")
-                            
-                            if is_vid:
-                                if audio_mode and not clean_mode:
-                                    ab = await asyncio.to_thread(extract_audio_from_video, content)
-                                    if ab: await message.answer_audio(BufferedInputFile(ab, filename="audio.mp3"))
-                                else:
-                                    kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
-                                    await message.answer_video(f, caption=caption_text, parse_mode="HTML", reply_markup=kb)
-                            else:
-                                await message.answer_photo(f, caption=caption_text, parse_mode="HTML")
-                                if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
-
-        # --- TWITTER ---
-        elif "twitter.com" in user_url or "x.com" in user_url:
-            tw_id = re.search(r"/status/(\d+)", user_url).group(1)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://api.fxtwitter.com/status/{tw_id}") as r:
-                    tweet = (await r.json()).get('tweet', {})
-            
-            caption_text = None
-            text_content = tweet.get('text', '')
-            author_name = tweet.get('author', {}).get('name', 'User')
-            
-            if not clean_mode:
-                text = await translate_text_logic(text_content, toggle_trans)
-                u = tweet.get('author', {})
-                caption_text = format_caption(u.get('name', 'User'), f"https://x.com/{u.get('screen_name')}", text, user_url)
-
-            audio_filename = f"{author_name} - {sanitize_filename(text_content)}.mp3"
-
-            media = tweet.get('media', {}).get('all', [])
-            has_video = any(m['type'] in ['video','gif'] for m in media)
-            
-            if has_video:
-                vid = next(m for m in media if m['type'] in ['video','gif'])
-                vb = await download_content(vid['url'])
-                if vb:
-                    if audio_mode and not clean_mode:
-                         aud_bytes = await asyncio.to_thread(extract_audio_from_video, vb)
-                         if aud_bytes:
-                             await message.answer_audio(BufferedInputFile(aud_bytes, filename=audio_filename))
-                    else:
-                        kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
-                        await message.answer_video(BufferedInputFile(vb, filename="tw.mp4"), caption=caption_text, parse_mode="HTML", reply_markup=kb)
-            else:
-                tasks = [download_content(m['url']) for m in media]
-                imgs = await asyncio.gather(*tasks)
+        # --- ОБРОБКА ТА ВІДПРАВКА ---
+        
+        # 1. Текст (Готуємо оригінал і переклад)
+        orig_text, trans_text = await prepare_text_data(raw_desc)
+        
+        # 2. Якщо просили "чисті" режими вручну (!a, -)
+        if clean_mode:
+            if is_video and final_video:
+                await message.answer_video(BufferedInputFile(final_video, filename="video.mp4"))
+            elif final_photo:
+                await message.answer_photo(BufferedInputFile(final_photo, filename="photo.jpg"))
+            elif final_gallery:
                 mg = MediaGroupBuilder()
-                for i, img in enumerate(imgs):
-                    if img:
-                        f = BufferedInputFile(img, filename=f"t{i}.jpg")
-                        if i==0 and caption_text: mg.add_photo(f, caption=caption_text, parse_mode="HTML")
-                        else: mg.add_photo(f)
+                for i, b in enumerate(final_gallery):
+                    if b: mg.add_photo(BufferedInputFile(b, filename=f"p{i}.jpg"))
                 await message.answer_media_group(mg.build())
-                if not clean_mode: await message.answer("Опції:", reply_markup=get_media_keyboard(user_url, 'photo'))
+            await status_msg.delete()
+            return
 
-        # --- YOUTUBE ---
-        elif "youtube.com" in user_url or "youtu.be" in user_url:
-            if not is_button_click: await status_msg.edit_text("📺 YouTube: Завантажую...")
-            
-            if not os.path.exists("downloads"): os.makedirs("downloads")
-            cobalt_data = await get_cobalt_data(user_url, is_youtube=True)
-            
-            if not cobalt_data: 
-                await status_msg.edit_text("❌ Всі сервери зайняті або відео недоступне.")
-                return
-            
-            direct_url = cobalt_data.get('url')
-            raw_path = f"downloads/raw_{uuid.uuid4()}.mp4"
-            with open(raw_path, 'wb') as f: f.write(await download_content(direct_url))
-            
-            final_path = raw_path
-            
-            if audio_mode:
-                audio_path = f"downloads/aud_{uuid.uuid4()}.mp3"
-                subprocess.run(['ffmpeg', '-y', '-i', raw_path, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', audio_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                await message.answer_audio(FSInputFile(audio_path))
-                if os.path.exists(audio_path): os.remove(audio_path)
-            else:
-                caption_text = None
-                if not clean_mode:
-                    caption_text = f"📺 <b>YouTube Video</b>\n\n🔗 <a href='{user_url}'>Оригінал</a>"
-                kb = get_media_keyboard(user_url, 'video') if (not clean_mode and not audio_mode) else None
-                await message.answer_video(FSInputFile(final_path), caption=caption_text, parse_mode="HTML", reply_markup=kb)
+        if audio_mode:
+            if final_audio:
+                await message.answer_audio(BufferedInputFile(final_audio, filename=audio_filename))
+            elif is_video and final_video:
+                ab = await asyncio.to_thread(extract_audio_from_video, final_video)
+                if ab: await message.answer_audio(BufferedInputFile(ab, filename=audio_filename))
+            await status_msg.delete()
+            return
 
-            if os.path.exists(raw_path): os.remove(raw_path)
+        # 3. СТАНДАРТНИЙ РЕЖИМ (З КНОПКАМИ)
+        
+        # Старт: ОРИГІНАЛ
+        caption = format_caption(author_name, author_link, orig_text, user_url)
+        
+        sent_msg = None
+        content_type = 'video' if is_video else 'photo'
+        
+        # Кеш для кнопок
+        cache_data = {
+            'orig_text': orig_text,
+            'trans_text': trans_text,
+            'author': author_name,
+            'link': author_link,
+            'url': user_url,
+            'current': 'orig', # Починаємо з оригіналу
+            'video': final_video,
+            'photo': final_photo,
+            'gallery': final_gallery, # Список байтів (обережно з RAM, але для Render ок)
+            'audio': final_audio,
+            'audio_name': audio_filename
+        }
 
-        if status_msg: await status_msg.delete()
+        # --- ВІДПРАВКА ---
+        if is_video and final_video:
+            sent_msg = await message.answer_video(
+                BufferedInputFile(final_video, filename="video.mp4"),
+                caption=caption,
+                parse_mode="HTML"
+            )
+        elif final_photo:
+            sent_msg = await message.answer_photo(
+                BufferedInputFile(final_photo, filename="photo.jpg"),
+                caption=caption,
+                parse_mode="HTML"
+            )
+        elif final_gallery:
+            content_type = 'photo' # Галерея це набір фото
+            mg = MediaGroupBuilder()
+            for i, b in enumerate(final_gallery):
+                if b: mg.add_photo(BufferedInputFile(b, filename=f"p{i}.jpg"))
+            
+            msgs = await message.answer_media_group(mg.build())
+            sent_msg = msgs[0] # Прив'язуємось до першого
+            
+            # Текст для галереї часто не влазить або не редагується в групі, 
+            # тому краще відправити його ОКРЕМИМ повідомленням, яке ми будемо редагувати.
+            sent_msg = await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
+
+        # Авто-аудіо для фото/галерей (без підпису, як ти просив)
+        if (final_photo or final_gallery) and final_audio:
+            await message.answer_audio(BufferedInputFile(final_audio, filename=audio_filename))
+
+        # Кріпимо кнопки
+        if sent_msg:
+            key = f"{sent_msg.chat.id}:{sent_msg.message_id}"
+            CACHE[key] = cache_data
+            
+            await bot.edit_message_reply_markup(
+                chat_id=sent_msg.chat.id,
+                message_id=sent_msg.message_id,
+                reply_markup=get_keyboard(key, content_type, 'orig')
+            )
+
+        await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Processing error: {e}")
-        if status_msg: await status_msg.edit_text("❌ Сталася помилка. Перевірте посилання.")
+        logging.error(f"Error: {e}")
+        if status_msg: await status_msg.edit_text("❌ Помилка. Перевірте посилання.")
 
-# ==========================
-# 🎮 ОБРОБНИКИ
-# ==========================
+# --- ОБРОБКА КНОПОК ---
+@dp.callback_query()
+async def handle_callbacks(callback: CallbackQuery):
+    try:
+        key = f"{callback.message.chat.id}:{callback.message.message_id}"
+        data = CACHE.get(key)
+        
+        if not data:
+            await callback.answer("Дані застаріли 😔", show_alert=True)
+            return
+
+        action = callback.data
+
+        if action == "get_clean":
+            if data['video']:
+                await callback.message.reply_video(BufferedInputFile(data['video'], filename="video.mp4"))
+            elif data['photo']:
+                await callback.message.reply_photo(BufferedInputFile(data['photo'], filename="photo.jpg"))
+            elif data['gallery']:
+                # Для галереї - скидаємо просто галерею без тексту
+                mg = MediaGroupBuilder()
+                for i, b in enumerate(data['gallery']):
+                    if b: mg.add_photo(BufferedInputFile(b, filename=f"p{i}.jpg"))
+                await callback.message.reply_media_group(mg.build())
+            await callback.answer()
+
+        elif action == "get_audio":
+            aud = data['audio']
+            if not aud and data['video']:
+                await callback.answer("Витягую звук...")
+                aud = await asyncio.to_thread(extract_audio_from_video, data['video'])
+            
+            if aud:
+                await callback.message.reply_audio(BufferedInputFile(aud, filename=data['audio_name']))
+            else:
+                await callback.answer("Немає звуку", show_alert=True)
+            await callback.answer()
+
+        elif action == "toggle_lang":
+            # Перемикання
+            new_lang = 'trans' if data['current'] == 'orig' else 'orig'
+            
+            # Для галереї (де текст окремим повідомленням) або звичайного поста
+            is_video = (data['video'] is not None)
+            ctype = 'video' if is_video else 'photo'
+            
+            text_to_show = data['trans_text'] if new_lang == 'trans' else data['orig_text']
+            new_caption = format_caption(data['author'], data['link'], text_to_show, data['url'])
+            
+            CACHE[key]['current'] = new_lang
+            
+            if data['gallery']:
+                # Для галереї ми редагуємо ТЕКСТОВЕ повідомлення (edit_message_text)
+                await bot.edit_message_text(
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                    text=new_caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=get_keyboard(key, ctype, new_lang)
+                )
+            else:
+                # Для медіа ми редагуємо ПІДПИС (edit_message_caption)
+                await bot.edit_message_caption(
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                    caption=new_caption,
+                    parse_mode="HTML",
+                    reply_markup=get_keyboard(key, ctype, new_lang)
+                )
+            await callback.answer()
+
+    except Exception as e:
+        logging.error(f"Callback Error: {e}")
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привіт! Я качаю з TikTok, Instagram, Twitter, Threads, Reddit та YouTube.")
+    await message.answer("Привіт! Кидай посилання на TikTok, Instagram або Twitter.")
 
-@dp.callback_query()
-async def on_button_click(callback: CallbackQuery):
-    try:
-        action, link_id = callback.data.split(":")
-        user_url = LINK_STORAGE.get(link_id)
-        if not user_url:
-            await callback.answer("Посилання застаріло.", show_alert=True)
-            return
-        await callback.answer("Виконую...")
-        if action == "clean":
-            await process_media_request(callback.message, user_url, clean_mode=True, is_button_click=True)
-        elif action == "audio":
-            await process_media_request(callback.message, user_url, audio_mode=True, clean_mode=False, is_button_click=True)
-    except: pass
-
-@dp.message(F.text.regexp(r'(https?://[^\s]+)') | F.caption.regexp(r'(https?://[^\s]+)'))
-@dp.edited_message(F.text.regexp(r'(https?://[^\s]+)') | F.caption.regexp(r'(https?://[^\s]+)'))
+@dp.message(F.text.regexp(r'(https?://[^\s]+)'))
 async def handle_link(message: types.Message):
-    content = message.text or message.caption
-    user_url, clean, audio, toggle_trans = parse_message_data(content)
-    await process_media_request(message, user_url, clean, audio, toggle_trans)
+    user_url, clean, audio = parse_message_data(message.text)
+    await process_media_request(message, user_url, clean, audio)
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
