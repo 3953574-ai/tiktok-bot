@@ -4,17 +4,16 @@ import os
 import asyncio
 import re
 import uuid
-import glob
+import random # Для випадкового вибору дзеркала
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import FSInputFile, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto, InputMediaVideo
 from aiogram.utils.media_group import MediaGroupBuilder
 import aiohttp
 from aiohttp import web
 from deep_translator import GoogleTranslator
 from langdetect import detect
 import instaloader
-import yt_dlp
 import static_ffmpeg
 import subprocess
 
@@ -29,10 +28,10 @@ RENDER_URL = "https://tiktok-bot-z88j.onrender.com"
 # Кеш
 STORAGE = {}
 
-# Дзеркала Cobalt (Розширений список)
+# Дзеркала Cobalt
 COBALT_MIRRORS = [
-    "https://api.cobalt.tools/api/json",
     "https://co.wuk.sh/api/json",
+    "https://api.cobalt.tools/api/json",
     "https://cobalt.pub/api/json",
     "https://api.succoon.com/api/json",
     "https://cobalt.zip/api/json",
@@ -146,16 +145,19 @@ def extract_audio_from_video(video_bytes):
         return audio_bytes
     except: return None
 
-# --- ЗАВАНТАЖУВАЧІ ---
-
 async def get_cobalt_data(user_url, is_youtube=False):
     payload = {"url": user_url}
     if is_youtube:
         payload.update({"videoQuality":"720","youtubeVideoCodec":"h264","audioFormat":"mp3","filenamePattern":"classic"})
     
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    
+    # Перемішуємо дзеркала для балансування
+    mirrors = COBALT_MIRRORS.copy()
+    random.shuffle(mirrors)
+
     async with aiohttp.ClientSession() as session:
-        for mirror in COBALT_MIRRORS:
+        for mirror in mirrors:
             try:
                 async with session.post(mirror, json=payload, headers=headers, timeout=15) as response:
                     if response.status == 200:
@@ -164,41 +166,6 @@ async def get_cobalt_data(user_url, is_youtube=False):
                         if data.get('status') in ['stream', 'redirect', 'picker']: return data
             except: continue
     return None
-
-async def download_instagram_fallback(user_url):
-    """Запасний варіант через yt-dlp, якщо Cobalt не працює"""
-    if not os.path.exists("downloads"): os.makedirs("downloads")
-    
-    # Емулюємо iPhone
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'best',
-        'outtmpl': f'downloads/%(id)s.%(ext)s',
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, user_url, download=True)
-            
-            file_id = info['id']
-            files = glob.glob(f"downloads/{file_id}*")
-            if not files: return None, None, None
-            
-            file_path = files[0]
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            
-            os.remove(file_path)
-            
-            is_video = info.get('ext') == 'mp4' or info.get('vcodec') != 'none'
-            # yt-dlp для інсти зазвичай качає тільки 1 файл, галереї він погано підтримує
-            # Тому повертаємо як список з 1 елемента
-            return [(content, 'video' if is_video else 'photo')], info.get('uploader'), info.get('description')
-    except Exception as e:
-        logging.error(f"Fallback yt-dlp failed: {e}")
-        return None, None, None
 
 async def keep_alive_ping():
     logging.info("🚀 Ping service started!")
@@ -300,55 +267,42 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
         elif any(x in user_url for x in ["instagram.com", "threads", "reddit.com", "redd.it", "youtube.com", "youtu.be"]):
             
             is_yt = "youtube.com" in user_url or "youtu.be" in user_url
+            success_download = False
             
-            # 1. Метадані через Instaloader (тільки для Інсти)
+            # 1. Instaloader (Тільки для Інсти - Метадані + Fallback завантаження)
+            # Ми використовуємо його об'єкт post, щоб дістати дані.
+            instaloader_post = None
             if "instagram.com" in user_url:
                 try:
                     shortcode = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url).group(1)
-                    def get_meta():
+                    def get_insta_obj():
                         L = instaloader.Instaloader(quiet=True)
                         L.context._user_agent = "Instagram 269.0.0.18.75 Android"
                         return instaloader.Post.from_shortcode(L.context, shortcode)
-                    post = await asyncio.to_thread(get_meta)
-                    author_name = post.owner_username
+                    
+                    instaloader_post = await asyncio.to_thread(get_insta_obj)
+                    
+                    # Заповнюємо метадані, бо Instaloader робить це краще за Cobalt
+                    author_name = instaloader_post.owner_username
                     author_link = f"https://instagram.com/{author_name}"
-                    raw_desc = (post.caption or "").split('\n')[0]
+                    raw_desc = (instaloader_post.caption or "").split('\n')[0]
                     audio_name = f"{author_name}.mp3"
-                except: pass
+                except:
+                    logging.warning("Instaloader metadata fetch failed")
 
-            # 2. Спроба скачати через Cobalt (Пріоритет)
+            # 2. Спроба скачати через COBALT (Основний метод)
             c_data = await get_cobalt_data(user_url, is_youtube=is_yt)
             
-            # 3. Якщо Cobalt не впорався -> Fallback (yt-dlp)
-            if not c_data and "instagram.com" in user_url:
-                logging.warning("Cobalt failed for Insta. Switching to yt-dlp fallback...")
-                gallery_data, fb_author, fb_desc = await download_instagram_fallback(user_url)
-                if gallery_data:
-                    if fb_author: author_name = fb_author
-                    if fb_desc: raw_desc = fb_desc
-                    # Розбираємо результат
-                    if len(gallery_data) == 1:
-                        content, ctype = gallery_data[0]
-                        if ctype == 'video': video_bytes = content
-                        else: photo_bytes = content
-                        gallery_data = [] # Очищаємо, бо вже розібрали
-                    # Якщо більше - залишаємо в gallery_data
-                else:
-                    raise Exception("All methods failed")
-            
-            elif not c_data:
-                raise Exception("API Error")
-            
-            # Якщо Cobalt спрацював
-            elif c_data:
+            if c_data:
+                success_download = True
+                # Якщо метаданих не було з Instaloader, беремо дефолтні
                 if author_name == "User" and not is_yt:
                     if "reddit" in user_url: author_name = "Reddit"
                     elif "threads" in user_url: author_name = "Threads"
                     elif "instagram" in user_url: author_name = "Instagram"
                     elif "youtube" in user_url: author_name = "YouTube"
-                    
-                    audio_name = "audio.mp3"
 
+                # Обробка Cobalt
                 if c_data.get('status') == 'picker':
                     tasks = []
                     types_list = []
@@ -362,13 +316,41 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                     files = await asyncio.gather(*tasks)
                     for i, f in enumerate(files):
                         if f: gallery_data.append((f, types_list[i]))
-
                 else:
                     url = c_data.get('url')
                     content = await download_content(url)
                     is_vid = ".mp4" in url or "video" in c_data.get('filename', '')
                     if is_vid: video_bytes = content
                     else: photo_bytes = content
+
+            # 3. 🔥 INSTALOADER FALLBACK 🔥 (Тільки якщо Cobalt не зміг і це Інстаграм)
+            if not success_download and instaloader_post:
+                logging.info("Cobalt failed. Using Instaloader Fallback...")
+                try:
+                    post = instaloader_post
+                    if post.typename == 'GraphSidecar':
+                        tasks = []
+                        types_list = []
+                        for node in post.get_sidecar_nodes():
+                            url = node.video_url if node.is_video else node.display_url
+                            t = 'video' if node.is_video else 'photo'
+                            tasks.append(download_content(url))
+                            types_list.append(t)
+                        files = await asyncio.gather(*tasks)
+                        for i, f in enumerate(files):
+                            if f: gallery_data.append((f, types_list[i]))
+                    else:
+                        url = post.video_url if post.is_video else post.url
+                        content = await download_content(url)
+                        if post.is_video: video_bytes = content
+                        else: photo_bytes = content
+                    
+                    success_download = True
+                except Exception as e:
+                    logging.error(f"Instaloader Fallback Error: {e}")
+
+            if not success_download:
+                raise Exception("All methods failed")
 
         # --- ВІДПРАВКА ---
         
@@ -459,11 +441,9 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             kb = get_photo_keyboard(data_id, current_mode=force_lang)
             
             if audio_bytes:
-                await message.answer_audio(
-                    BufferedInputFile(audio_bytes, filename=audio_name),
-                    reply_markup=kb
-                )
+                await message.answer_audio(BufferedInputFile(audio_bytes, filename=audio_name), reply_markup=kb)
             else:
+                # Невидимий символ для кнопок
                 await message.answer("⠀", reply_markup=kb)
 
         if (photo_bytes) and audio_bytes:
@@ -473,7 +453,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        if status_msg: await status_msg.edit_text("❌ Помилка завантаження (сервіс блокує).")
+        if status_msg: await status_msg.edit_text("❌ Помилка завантаження.")
 
 # --- HANDLERS ---
 
@@ -552,6 +532,7 @@ async def handle_link(message: types.Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    import glob # Додав
     await asyncio.gather(start_web_server(), keep_alive_ping(), dp.start_polling(bot))
 
 if __name__ == "__main__":
