@@ -41,23 +41,28 @@ dp = Dispatcher()
 translator = GoogleTranslator(source='auto', target='uk')
 
 # --- КЛАВІАТУРИ ---
-def get_media_keyboard(data_id, content_type='video'):
+def get_media_keyboard(data_id, content_type='video', is_translated=False):
     # content_type: 'video' або 'photo'
+    # is_translated: чи показувати кнопку "Назад до оригіналу"
     
     buttons = []
     
-    # 1. Кнопка Переклад (🇺🇦)
-    trans_btn = InlineKeyboardButton(text="🇺🇦 Переклад", callback_data=f"trans:{data_id}")
+    # 1. Кнопка-перемикач мови
+    if is_translated:
+        trans_btn = InlineKeyboardButton(text="🌐 Оригінал", callback_data=f"orig:{data_id}")
+    else:
+        trans_btn = InlineKeyboardButton(text="🇺🇦 Переклад", callback_data=f"trans:{data_id}")
     
-    # 2. Кнопка Чисте Відео/Фото (🎬)
+    # 2. Кнопка Чисте Відео/Фото
     clean_btn = InlineKeyboardButton(text="🎬 Відео" if content_type == 'video' else "🖼 Фото", callback_data=f"clean:{data_id}")
     
     if content_type == 'video':
-        # 3. Кнопка Аудіо (🎵)
+        # 3. Кнопка Аудіо
         audio_btn = InlineKeyboardButton(text="🎵 Аудіо", callback_data=f"audio:{data_id}")
+        
         # Рядок 1: Аудіо | Відео
         buttons.append([audio_btn, clean_btn])
-        # Рядок 2: Переклад
+        # Рядок 2: Переклад/Оригінал
         buttons.append([trans_btn])
     else:
         # Для фото: Відео(Фото) | Переклад
@@ -72,7 +77,7 @@ def save_data_for_buttons(url, desc, author, profile):
     unique_id = str(uuid.uuid4())[:8]
     LINK_STORAGE[unique_id] = {
         'url': url,
-        'desc': desc,
+        'desc': desc, # Тут завжди зберігається ОРИГІНАЛ
         'author': author,
         'profile': profile
     }
@@ -92,7 +97,6 @@ def parse_message_data(text):
     found_url = url_match.group(1)
     cmd_text = text.replace(found_url, "").lower()
     
-    # Технічні команди (залишили для "своїх")
     clean_mode = ('-' in cmd_text or '!' in cmd_text or 'clear' in cmd_text)
     audio_mode = ('!a' in cmd_text or 'audio' in cmd_text)
     
@@ -107,7 +111,6 @@ async def download_content(url):
                 if response.status == 200: return await response.read()
     except: return None
 
-# Функція простого перекладу тексту
 async def perform_translation(text):
     if not text or not text.strip(): return ""
     try:
@@ -154,7 +157,7 @@ async def start_web_server():
     await site.start()
 
 # ==========================================
-# 🔥 УНІВЕРСАЛЬНА ЛОГІКА ОБРОБКИ 🔥
+# 🔥 ЛОГІКА ОБРОБКИ 🔥
 # ==========================================
 
 async def process_media_request(message: types.Message, user_url, clean_mode=False, audio_mode=False, is_button_click=False):
@@ -175,7 +178,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             profile_link = f"https://www.tiktok.com/@{unique_id}"
             title_text = data.get('title', '')
             
-            # Зберігаємо дані для кнопок
+            # Зберігаємо дані
             data_id = save_data_for_buttons(user_url, title_text, author_name, profile_link)
             
             # Формуємо підпис (в оригіналі)
@@ -207,10 +210,8 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 
                 await message.answer_media_group(mg.build())
                 
-                # Кнопки для фото
                 kb = get_media_keyboard(data_id, content_type='photo') if not clean_mode else None
                 
-                # Якщо є аудіо -> кидаємо з кнопками. Якщо ні -> кидаємо просто кнопки
                 if music_file and not clean_mode:
                     await message.answer_audio(music_file, reply_markup=kb)
                 elif not clean_mode:
@@ -246,7 +247,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             
             author_name = post.owner_username
             profile_link = f"https://instagram.com/{author_name}"
-            raw_cap = (post.caption or "").split('\n')[0] # Беремо перший рядок для заголовку
+            raw_cap = (post.caption or "").split('\n')[0]
             
             data_id = save_data_for_buttons(user_url, raw_cap, author_name, profile_link)
             
@@ -353,52 +354,40 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
         if status_msg: await status_msg.edit_text("❌ Сталася помилка. Перевірте посилання.")
 
 # ==========================
-# 🎮 ОБРОБНИКИ
+# 🎮 ОБРОБНИКИ (BUTTONS)
 # ==========================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 <b>Привіт!</b>\n\n"
-        "Я завантажую контент у найкращій якості з:\n"
-        "🎵 <b>TikTok</b>\n"
-        "📸 <b>Instagram</b>\n"
-        "🐦 <b>Twitter (X)</b>\n\n"
-        "Просто надішли мені посилання 🚀",
-        parse_mode="HTML"
-    )
+    await message.answer("👋 <b>Привіт!</b>\n\nЯ завантажую контент з:\n🎵 <b>TikTok</b>\n📸 <b>Instagram</b>\n🐦 <b>Twitter (X)</b>", parse_mode="HTML")
 
 @dp.callback_query()
 async def on_button_click(callback: CallbackQuery):
     try:
         action, data_id = callback.data.split(":")
         
-        # Отримуємо дані про пост з пам'яті
+        # Отримуємо дані
         post_data = LINK_STORAGE.get(data_id)
-        
         if not post_data:
-            await callback.answer("Дані застаріли (бот був перезавантажений).", show_alert=True)
+            await callback.answer("Дані застаріли.", show_alert=True)
             return
         
         url = post_data['url']
         
-        # --- ЛОГІКА КНОПОК ---
-        
-        # 1. 🎬 Чисте відео / Фото
+        # 1. ЧИСТЕ ВІДЕО/ФОТО
         if action == "clean":
             await callback.answer("Надсилаю файл...")
             await process_media_request(callback.message, url, clean_mode=True, is_button_click=True)
         
-        # 2. 🎵 Аудіо
+        # 2. АУДІО
         elif action == "audio":
             await callback.answer("Витягую звук...")
             await process_media_request(callback.message, url, audio_mode=True, clean_mode=False, is_button_click=True)
             
-        # 3. 🇺🇦 Переклад
+        # 3. ПЕРЕКЛАД (ТУДИ-СЮДИ)
         elif action == "trans":
-            await callback.answer("Перекладаю...")
+            await callback.answer("Змінюю мову...")
             
-            # Робимо переклад
             translated_desc = await perform_translation(post_data['desc'])
             
             # Формуємо новий підпис
@@ -409,17 +398,36 @@ async def on_button_click(callback: CallbackQuery):
                 url
             )
             
-            # Редагуємо повідомлення, до якого прикріплена кнопка
+            # Оновлюємо клавіатуру (ставимо "Оригінал")
+            # Ми не знаємо точно, чи це відео чи фото, але в LINK_STORAGE можна було б зберігати type.
+            # Спростимо: якщо в повідомленні є відео - то video, інакше photo.
+            is_video = (callback.message.video is not None)
+            new_kb = get_media_keyboard(data_id, content_type='video' if is_video else 'photo', is_translated=True)
+            
             try:
-                await callback.message.edit_caption(
-                    caption=new_caption,
-                    parse_mode="HTML",
-                    reply_markup=callback.message.reply_markup # Залишаємо кнопки на місці
-                )
-            except Exception as e:
-                logging.error(f"Edit error: {e}")
-                # Якщо змінити не вийшло (наприклад, текст той самий), нічого не робимо
-                pass
+                await callback.message.edit_caption(caption=new_caption, parse_mode="HTML", reply_markup=new_kb)
+            except: pass
+
+        # 4. ОРИГІНАЛ (ПОВЕРНЕННЯ)
+        elif action == "orig":
+            await callback.answer("Відновлюю оригінал...")
+            
+            # Беремо оригінальний текст зі сховища
+            orig_desc = post_data['desc']
+            
+            new_caption = format_caption(
+                post_data['author'],
+                post_data['profile'],
+                orig_desc,
+                url
+            )
+            
+            is_video = (callback.message.video is not None)
+            new_kb = get_media_keyboard(data_id, content_type='video' if is_video else 'photo', is_translated=False)
+            
+            try:
+                await callback.message.edit_caption(caption=new_caption, parse_mode="HTML", reply_markup=new_kb)
+            except: pass
 
     except Exception as e:
         logging.error(f"Callback error: {e}")
