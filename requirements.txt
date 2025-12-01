@@ -4,3 +4,4 @@ deep-translator
 langdetect
 instaloader
 static-ffmpeg
+yt-dlp
