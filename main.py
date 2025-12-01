@@ -24,9 +24,10 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TIKTOK_API_URL = "https://www.tikwm.com/api/"
 RENDER_URL = "https://tiktok-bot-z88j.onrender.com" 
 
-# Кеш метаданих (щоб працювали кнопки)
+# Кеш для текстів та посилань
 STORAGE = {}
 
+# Дзеркала Cobalt
 COBALT_MIRRORS = [
     "https://co.wuk.sh/api/json",
     "https://api.cobalt.tools/api/json",
@@ -50,41 +51,40 @@ translator = GoogleTranslator(source='auto', target='uk')
 
 # --- КЛАВІАТУРИ ---
 
-def get_video_keyboard(data_id, current_lang='orig'):
+def get_video_keyboard(data_id, current_mode='trans'):
     """
-    current_lang: яка мова ЗАРАЗ відображається.
-    Якщо 'orig', то кнопка пропонує 'trans' (Переклад).
-    Якщо 'trans', то кнопка пропонує 'orig' (Оригінал).
+    current_mode: 
+    'trans' - зараз показано переклад (наступна дія - показати оригінал)
+    'orig' - зараз показано оригінал (наступна дія - показати переклад)
     """
-    buttons = [
-        [
-            InlineKeyboardButton(text="🎵 Аудіо", callback_data=f"vid_audio:{data_id}"),
-            InlineKeyboardButton(text="🎬 Відео", callback_data=f"vid_clean:{data_id}")
-        ]
+    buttons = []
+    row_main = [
+        InlineKeyboardButton(text="🎵 Аудіо", callback_data=f"vid_audio:{data_id}"),
+        InlineKeyboardButton(text="🎬 Відео", callback_data=f"vid_clean:{data_id}")
     ]
+    buttons.append(row_main)
     
+    # Логіка перекладу
     data = STORAGE.get(data_id)
-    # Показуємо кнопку перекладу тільки якщо є різниця між оригіналом і перекладом
     if data and data.get('has_diff'):
-        if current_lang == 'orig':
-            btn = InlineKeyboardButton(text="🇺🇦 Переклад", callback_data=f"vid_lang:trans:{data_id}")
-        else:
+        if current_mode == 'trans':
             btn = InlineKeyboardButton(text="🌐 Оригінал", callback_data=f"vid_lang:orig:{data_id}")
+        else:
+            btn = InlineKeyboardButton(text="🇺🇦 Переклад", callback_data=f"vid_lang:trans:{data_id}")
         buttons.append([btn])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_photo_keyboard(data_id, current_lang='orig'):
-    buttons = [
-        [InlineKeyboardButton(text="🙈 Тільки фото", callback_data=f"pho_clean:{data_id}")]
-    ]
+def get_photo_keyboard(data_id, current_mode='trans'):
+    buttons = []
+    buttons.append([InlineKeyboardButton(text="🙈 Тільки фото", callback_data=f"pho_clean:{data_id}")])
     
     data = STORAGE.get(data_id)
     if data and data.get('has_diff'):
-        if current_lang == 'orig':
-            btn = InlineKeyboardButton(text="🇺🇦 Переклад", callback_data=f"pho_resend:trans:{data_id}")
-        else:
+        if current_mode == 'trans':
             btn = InlineKeyboardButton(text="🌐 Оригінал", callback_data=f"pho_resend:orig:{data_id}")
+        else:
+            btn = InlineKeyboardButton(text="🇺🇦 Переклад", callback_data=f"pho_resend:trans:{data_id}")
         buttons.append([btn])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -119,18 +119,16 @@ async def download_content(url):
                 if response.status == 200: return await response.read()
     except: return None
 
-async def prepare_text_data(text):
+# 🔥 ВИПРАВЛЕНА ФУНКЦІЯ 🔥
+async def prepare_texts(text):
     """Повертає (оригінал, переклад, чи_є_різниця)"""
     if not text: return "", "", False
     try:
         lang = detect(text)
-        # Якщо мова вже українська, то різниці немає
-        if lang == 'uk':
-            return text, text, False
-        
-        # Перекладаємо
-        trans = await asyncio.to_thread(translator.translate, text)
-        return text, trans, True
+        if lang != 'uk':
+            trans = await asyncio.to_thread(translator.translate, text)
+            return text, trans, True
+        return text, text, False
     except:
         return text, text, False
 
@@ -186,12 +184,12 @@ async def start_web_server():
     await site.start()
 
 # ==========================================
-# 🔥 ГОЛОВНА ЛОГІКА 🔥
+# 🔥 MAIN LOGIC 🔥
 # ==========================================
 
-async def process_media_request(message: types.Message, user_url, clean_mode=False, audio_mode=False, is_button_click=False, force_lang='orig'):
+async def process_media_request(message: types.Message, user_url, clean_mode=False, audio_mode=False, is_button_click=False, force_lang='trans'):
     
-    # Не показуємо "Обробляю", якщо це клік кнопки (переклад) або авто-репост
+    # Не показуємо "Обробляю" при натисканні кнопок або авто-репості
     status_msg = None
     if not clean_mode and not audio_mode and not is_button_click and message.from_user.id != bot.id:
         status_msg = await message.reply("⏳ Обробляю...")
@@ -264,7 +262,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
         # --- INSTAGRAM/THREADS/REDDIT ---
         elif any(x in user_url for x in ["instagram.com", "threads", "reddit.com", "redd.it"]):
             success = False
-            # Instaloader (Insta Only)
+            # Instaloader
             if "instagram.com" in user_url:
                 try:
                     shortcode = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', user_url).group(1)
@@ -332,11 +330,9 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             return
 
         # 3. STANDARD MODE
-        # Визначаємо, який текст показувати (дефолт = оригінал)
         text_to_show = trans_text if force_lang == 'trans' else orig_text
         caption = format_caption(author_name, author_link, text_to_show, user_url)
         
-        # Дані для кнопок
         data_id = str(uuid.uuid4())[:8]
         STORAGE[data_id] = {
             'orig_text': orig_text,
@@ -360,7 +356,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
             STORAGE[data_id]['file_id'] = sent.video.file_id
             await bot.edit_message_reply_markup(
                 chat_id=sent.chat.id, message_id=sent.message_id,
-                reply_markup=get_video_keyboard(data_id, current_lang=force_lang)
+                reply_markup=get_video_keyboard(data_id, current_mode=force_lang)
             )
 
         # --- PHOTO ---
@@ -370,7 +366,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 caption=caption,
                 parse_mode="HTML"
             )
-            kb = get_photo_keyboard(data_id, current_lang=force_lang)
+            kb = get_photo_keyboard(data_id, current_mode=force_lang)
             await message.answer("Опції:", reply_markup=kb)
 
         # --- GALLERY ---
@@ -381,7 +377,7 @@ async def process_media_request(message: types.Message, user_url, clean_mode=Fal
                 mg.add_photo(BufferedInputFile(b, filename=f"p{i}.jpg"), caption=cap, parse_mode="HTML")
             await message.answer_media_group(mg.build())
             
-            kb = get_photo_keyboard(data_id, current_lang=force_lang)
+            kb = get_photo_keyboard(data_id, current_mode=force_lang)
             await message.answer("Опції:", reply_markup=kb)
 
         # Авто-аудіо
@@ -407,12 +403,13 @@ async def handle_callbacks(callback: CallbackQuery):
             data_id = parts[1]
             data = STORAGE.get(data_id)
             if data and data.get('file_id'):
+                # Відправляємо новим повідомленням (answer_video)
                 await callback.message.answer_video(data['file_id']) 
             else:
                 await callback.answer("Файл втрачено", show_alert=True)
             await callback.answer()
 
-        # 2. AUDIO (Нове повідомлення)
+        # 2. AUDIO (Перезалив)
         elif action == "vid_audio":
             data_id = parts[1]
             data = STORAGE.get(data_id)
@@ -437,7 +434,7 @@ async def handle_callbacks(callback: CallbackQuery):
                         chat_id=callback.message.chat.id,
                         message_id=callback.message.message_id,
                         caption=new_cap, parse_mode="HTML",
-                        reply_markup=get_video_keyboard(data_id, current_lang=target_lang)
+                        reply_markup=get_video_keyboard(data_id, current_mode=target_lang)
                     )
                 except: pass
             await callback.answer()
@@ -459,7 +456,7 @@ async def handle_callbacks(callback: CallbackQuery):
             data = STORAGE.get(data_id)
             
             if data:
-                await callback.message.delete() # Видаляємо старе
+                await callback.message.delete() 
                 await process_media_request(callback.message, data['user_url'], force_lang=target_lang, is_button_click=True)
             else:
                 await callback.answer("Застаріло", show_alert=True)
@@ -475,7 +472,7 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text.regexp(r'(https?://[^\s]+)'))
 async def handle_link(message: types.Message):
     user_url, clean, audio = parse_message_data(message.text)
-    # По замовчуванню force_lang='orig' (оригінал)
+    # По замовчуванню 'orig' (ОРИГІНАЛ)
     await process_media_request(message, user_url, clean, audio, force_lang='orig')
 
 async def main():
