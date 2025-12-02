@@ -5,3 +5,4 @@ langdetect
 instaloader
 yt-dlp
 static-ffmpeg
+python-dotenv
